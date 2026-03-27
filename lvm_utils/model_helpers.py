@@ -67,10 +67,11 @@ def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_co
             torch_dtype=torch.bfloat16,  # compute dtype
             quantization_config=quantization_config
         )
+        processor = AutoProcessor.from_pretrained(cached_path.absolute())
         model = prepare_model_for_kbit_training(model)
         if load_peft:
             model = get_peft_model(model, peft_config)
-        processor = AutoProcessor.from_pretrained(model_id)
+        
         return model, processor
     else:
         model = AutoModelForImageTextToText.from_pretrained(
@@ -79,12 +80,13 @@ def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_co
             torch_dtype=torch.bfloat16,
             quantization_config=quantization_config
         )
+        processor = AutoProcessor.from_pretrained(model_id)
         model = prepare_model_for_kbit_training(model)
         if cache == True:
             model.save_pretrained(cached_path.absolute())
+            processor.save_pretrained(cached_path.absolute())
         if load_peft:
             model = get_peft_model(model, peft_config)
-        processor = AutoProcessor.from_pretrained(model_id)
         return model, processor
 
 def first_stage(image : Image.Image, processor : AutoProcessor, model : AutoModelForImageTextToText, max_tokens = 300) -> Dict[str, Any]:
