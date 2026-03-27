@@ -64,7 +64,7 @@ def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_co
         model = AutoModelForImageTextToText.from_pretrained(
             cached_path.absolute(),
             device_map="auto",
-            torch_dtype=torch.bfloat16,  # compute dtype
+            dtype=torch.bfloat16,  # compute dtype
             quantization_config=quantization_config
         )
         model = prepare_model_for_kbit_training(model)
@@ -76,7 +76,7 @@ def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_co
         model = AutoModelForImageTextToText.from_pretrained(
             model_id,
             device_map="auto",
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             quantization_config=quantization_config
         )
         model = prepare_model_for_kbit_training(model)
