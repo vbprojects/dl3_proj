@@ -217,5 +217,11 @@ __marimo__/
 data/*
 model.safetensors
 cache_data/*
+cache_data_validation/*
 .github/*
 *.zip
+*.csv
+runs/*
+*.json
+*.jinja
+*.npz
