@@ -97,20 +97,24 @@ def create_hashable_conversation(conversation, cache_root="./cache_data", webp_q
     )
     return serial
 
-def save_conversations(conversations, out_path = None, webp_quality=80):
+def save_conversations(conversations, out_path=None, labels=None, webp_quality=80):
     """
     conversations: list of conversation dicts
       each message content item is like:
       {"type": "image", "image": PIL.Image.Image}
       or {"type": "text", "text": "..."}
     out_path: e.g. "conversations.zip"
+    labels: list of labels associated with each conversation (optional)
     """
     out_path = Path(out_path)
     manifest = []
     seen = {}  # hash -> archive path
 
+    if labels is not None and len(labels) != len(conversations):
+        raise ValueError("labels must have the same length as conversations")
+
     with zipfile.ZipFile(out_path, mode="w", compression=zipfile.ZIP_LZMA) as zf:
-        for conv in conversations:
+        for i, conv in enumerate(conversations):
             conv_out = []
             for msg in conv:
                 msg_out = {"role": msg["role"], "content": []}
@@ -131,25 +135,41 @@ def save_conversations(conversations, out_path = None, webp_quality=80):
                     else:
                         msg_out["content"].append(item)
                 conv_out.append(msg_out)
-            manifest.append(conv_out)
+            
+            entry = {"conversation": conv_out}
+            if labels is not None:
+                entry["label"] = labels[i]
+            manifest.append(entry)
 
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False))
 
 
 def load_conversations(in_path):
     """
-    Returns conversations in original shape, restoring PIL images:
+    Returns (conversations, labels) if labels were saved, else just returns conversations
+    in original shape, restoring PIL images:
       {"type":"image", "image": PIL.Image.Image}
     """
     in_path = Path(in_path)
     conversations = []
+    labels = []
+    has_labels = False
 
     with zipfile.ZipFile(in_path, mode="r") as zf:
         manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
 
-        for conv in manifest:
+        for entry in manifest:
+            # Handle backward compatibility where manifest is just a list of lists
+            if isinstance(entry, list):
+                conv_data = entry
+            else:
+                conv_data = entry.get("conversation", [])
+                if "label" in entry:
+                    labels.append(entry["label"])
+                    has_labels = True
+
             conv_out = []
-            for msg in conv:
+            for msg in conv_data:
                 msg_out = {"role": msg["role"], "content": []}
                 for item in msg["content"]:
                     if item["type"] == "image_ref":
@@ -161,6 +181,8 @@ def load_conversations(in_path):
                 conv_out.append(msg_out)
             conversations.append(conv_out)
 
+    if has_labels:
+        return conversations, labels
     return conversations
 
 def upscale_image(image : Image.Image, scale : float) -> Image.Image:

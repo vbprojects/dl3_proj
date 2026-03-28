@@ -13,17 +13,17 @@ from torch.nn.utils.rnn import pad_sequence
 from dataclasses import dataclass
 
 
-# _peft_config = MissConfig(
-#     task_type=TaskType.CAUSAL_LM,
-#     r=64,
-#     mini_r=8,
-#     miss_dropout=0.05,
-#     bias="none",
-#     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-# )
-default_peft_config = peft.IA3Config(
-    task_type=TaskType.SEQ_CLS, target_modules=["k_proj", "v_proj", "down_proj", "o_proj"], feedforward_modules=["down_proj"]
+default_peft_config = MissConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=16,
+    mini_r=8,
+    miss_dropout=0.05,
+    bias="none",
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
 )
+# default_peft_config = peft.IA3Config(
+#     task_type=TaskType.SEQ_CLS, target_modules=["k_proj", "v_proj", "down_proj", "o_proj"], feedforward_modules=["down_proj"]
+# )
 
 # default_peft_config = peft.LoraConfig(
 #     r=16,
@@ -287,3 +287,141 @@ def get_batch_conversation_embeddings_with_config(
         append_token_id=config.append_token_id,
         pad_token_id=config.pad_token_id,
     )
+
+def get_batch_conversation_embeddings_with_config_2(
+    model,
+    processor,
+    conversations,
+    config: ConversationEmbeddingConfig,
+    normalize=True,
+):
+    """Training-loop friendly wrapper using precomputed token ids."""
+    return get_batch_conversation_embeddings_2(
+        model=model,
+        processor=processor,
+        conversations=conversations,
+        normalize=normalize,
+        append_token_id=config.append_token_id,
+        pad_token_id=config.pad_token_id,
+    )
+
+def get_batch_conversation_embeddings_2(
+    model,
+    processor,
+    conversations,
+    normalize=True,
+    append_token_id=None,
+    pad_token_id=None,
+):
+    device = next(model.parameters()).device
+
+    # 1) Process conversations. 
+    # add_generation_prompt=False prevents appending unclosed assistant headers 
+    # before our explicit pooling token.
+    batch = processor.apply_chat_template(
+        conversations,
+        add_generation_prompt=False, 
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+        padding=True,
+    )
+
+    batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
+    input_ids = batch["input_ids"]          
+    attention_mask = batch["attention_mask"]  
+
+    prompt_lens = attention_mask.sum(dim=1).long() 
+
+    # 2) Token ID resolution
+    if append_token_id is None:
+        tok = processor.tokenizer
+        append_token_id = getattr(tok, "eos_token_id", None) or \
+                          getattr(tok, "sep_token_id", None) or \
+                          getattr(tok, "pad_token_id", None)
+        if append_token_id is None:
+            raise ValueError("No eos/sep/pad token id available to append.")
+
+    if pad_token_id is None:
+        pad_token_id = getattr(processor.tokenizer, "pad_token_id", 0)
+
+    # 3) Build variable-length sequences
+    seqs = []
+    for i in range(input_ids.size(0)):
+        n = int(prompt_lens[i].item())
+        seq_i = input_ids[i, :n]
+        append_tok = torch.tensor([append_token_id], dtype=seq_i.dtype, device=device)
+        seq_i = torch.cat([seq_i, append_tok], dim=0)
+        seqs.append(seq_i)
+
+    # Re-pad sequences
+    input_ids2 = pad_sequence(seqs, batch_first=True, padding_value=pad_token_id)
+    attention_mask2 = (input_ids2 != pad_token_id).long()
+
+    extra = {k: v for k, v in batch.items() if k not in ("input_ids", "attention_mask")}
+
+    # 4) Architectural Bypass: Target the base model directly
+    # This executes the transformer layers and final LayerNorm, skipping lm_head.
+    # Safe for FSDP, DDP, and torch.compile.
+    base_model = model.model if hasattr(model, "model") else model.base_model.model
+    
+    out = base_model(
+        input_ids=input_ids2,
+        attention_mask=attention_mask2,
+        return_dict=True,
+        **extra,
+    )
+    
+    last_hidden = out.last_hidden_state  # [B, L2, H]
+
+    # 5) Gather appended-token embeddings
+    batch_idx = torch.arange(last_hidden.size(0), device=device)
+    emb = last_hidden[batch_idx, prompt_lens, :]  
+
+    if normalize:
+        emb = F.normalize(emb, p=2, dim=-1)
+
+    return emb, prompt_lens
+def first_stage_batch(images : list[Image.Image], processor : AutoProcessor, model : AutoModelForImageTextToText, max_tokens = 300) -> list[Dict[str, Any]]:
+    conversations = []
+    for image in images:
+        conversations.append(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": "Describe the image in great detail."},
+                    ],
+                },
+            ]
+        )
+
+    orig_padding_side = processor.tokenizer.padding_side
+    processor.tokenizer.padding_side = "left"
+
+    inputs = processor.apply_chat_template(
+        conversations,
+        add_generation_prompt=True,
+        return_tensors="pt",
+        return_dict=True,
+        tokenize=True,
+        padding=True,
+    ).to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=max_tokens)
+        new_tokens = outputs[:, inputs["input_ids"].shape[1]:]
+        assistant_texts = processor.batch_decode(new_tokens, skip_special_tokens=True)
+
+    processor.tokenizer.padding_side = orig_padding_side
+
+    for i in range(len(conversations)):
+        conversations[i].append({"role": "assistant", "content": [{"type": "text", "text": assistant_texts[i].strip()}]})
+        conversations[i].append({"role": "user",
+            "content": [
+                {"type": "text", "text": "You must make a guess, make your best guess, even if you are not sure. What is the image of? One word"}
+            ]})
+    
+    return conversations
+
