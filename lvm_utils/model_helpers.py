@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from dataclasses import dataclass
+from lvm_utils.utils import upscale_image
 
 
 default_peft_config = MissConfig(
@@ -43,7 +44,7 @@ default_quantization_config = BitsAndBytesConfig(
     
 model_id = "LiquidAI/LFM2-VL-450M"
 
-def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_config, quantization_config : Any = default_quantization_config, cache = True, load_peft = True) -> Tuple[AutoModelForImageTextToText, AutoProcessor]:
+def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_config, quantization_config : Any = default_quantization_config, cache = True, load_peft = True, quantize = False) -> Tuple[AutoModelForImageTextToText, AutoProcessor]:
     """
     Load a model and processor with PEFT configuration. If cache is True, it will save the original model to disk and load from there in subsequent calls to speed up loading.
     
@@ -53,6 +54,7 @@ def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_co
         quantization_config (Any): The quantization configuration to apply to the model.
         cache (bool): Whether to cache the original model to disk for faster loading in subsequent calls
         load_peft (bool): Whether to load the PEFT configuration.
+        quantize (bool): Whether to apply quantization to the model.
 
     Returns:
         model (AutoModelForImageTextToText): The loaded model with PEFT applied.
@@ -65,10 +67,10 @@ def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_co
             cached_path.absolute(),
             device_map="auto",
             torch_dtype=torch.bfloat16,  # compute dtype
-            quantization_config=quantization_config
+            quantization_config=quantization_config if quantize else None
         )
         processor = AutoProcessor.from_pretrained(cached_path.absolute())
-        model = prepare_model_for_kbit_training(model)
+        model = prepare_model_for_kbit_training(model) if quantize else model
         if load_peft:
             model = get_peft_model(model, peft_config)
         
@@ -78,10 +80,10 @@ def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_co
             model_id,
             device_map="auto",
             torch_dtype=torch.bfloat16,
-            quantization_config=quantization_config
+            quantization_config=quantization_config if quantize else None
         )
         processor = AutoProcessor.from_pretrained(model_id)
-        model = prepare_model_for_kbit_training(model)
+        model = prepare_model_for_kbit_training(model) if quantize else model
         if cache == True:
             model.save_pretrained(cached_path.absolute())
             processor.save_pretrained(cached_path.absolute())
@@ -105,7 +107,7 @@ def first_stage(image : Image.Image, processor : AutoProcessor, model : AutoMode
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image},
+                {"type": "image", "image": upscale_image(image, 7)},
                 {"type": "text", "text": "Describe the image in great detail."},
             ],
         },
