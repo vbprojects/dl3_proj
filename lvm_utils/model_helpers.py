@@ -44,7 +44,7 @@ default_quantization_config = BitsAndBytesConfig(
     
 model_id = "LiquidAI/LFM2-VL-450M"
 
-def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_config, quantization_config : Any = default_quantization_config, cache = True, load_peft = True, quantize = False) -> Tuple[AutoModelForImageTextToText, AutoProcessor]:
+def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_config, quantization_config : Any = default_quantization_config, cache = True, load_peft = True, quantize = False, torch_dtype = torch.bfloat16) -> Tuple[AutoModelForImageTextToText, AutoProcessor]:
     """
     Load a model and processor with PEFT configuration. If cache is True, it will save the original model to disk and load from there in subsequent calls to speed up loading.
     
@@ -63,12 +63,20 @@ def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_co
     
     cached_path = Path("./" + model_id + "-original")
     if cached_path.exists() and cache:
-        model = AutoModelForImageTextToText.from_pretrained(
-            cached_path.absolute(),
-            device_map="auto",
-            torch_dtype=torch.bfloat16,  # compute dtype
-            quantization_config=quantization_config if quantize else None
-        )
+        model = None
+        if quantize:
+            model = AutoModelForImageTextToText.from_pretrained(
+                cached_path.absolute(),
+                device_map="auto",
+                torch_dtype=torch_dtype,  # compute dtype
+                quantization_config=quantization_config
+            )
+        else:
+            model = AutoModelForImageTextToText.from_pretrained(
+                cached_path.absolute(),
+                device_map="auto",
+                torch_dtype=torch_dtype,
+            )
         processor = AutoProcessor.from_pretrained(cached_path.absolute())
         model = prepare_model_for_kbit_training(model) if quantize else model
         if load_peft:
@@ -76,12 +84,20 @@ def load_model_id(model_id : str = model_id, peft_config : Any = default_peft_co
         
         return model, processor
     else:
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_id,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            quantization_config=quantization_config if quantize else None
-        )
+        model = None
+        if quantize:
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_id,
+                device_map="auto",
+                torch_dtype=torch_dtype,
+                quantization_config=quantization_config
+            )
+        else:
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_id,
+                device_map="auto",
+                torch_dtype=torch_dtype,
+            )
         processor = AutoProcessor.from_pretrained(model_id)
         model = prepare_model_for_kbit_training(model) if quantize else model
         if cache == True:
