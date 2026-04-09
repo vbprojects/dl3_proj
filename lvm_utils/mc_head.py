@@ -41,10 +41,8 @@ class MonteCarloDropoutHead(nn.Module):
         Returns:
             torch.Tensor: Output tensor of shape (..., output_dim)
         """
-        x = F.selu(x)
         x = self.dropout(x)
-        x = self.linear(x)
-        embeddings = F.selu(x)
-        x = self.final_layer(embeddings)
+        embeddings = self.linear(x)
+        x = self.final_layer(F.gelu(embeddings))
         # x = F.softmax(x, dim=-1)
         return x, embeddings
