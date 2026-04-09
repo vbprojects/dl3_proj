@@ -263,9 +263,11 @@ def get_batch_conversation_embeddings(
         conversations,
         add_generation_prompt=True,
         tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
-        padding=True,
+        processor_kwargs={
+            "return_dict": True,
+            "return_tensors": "pt",
+            "padding": True,
+        }
     )
 
     batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
