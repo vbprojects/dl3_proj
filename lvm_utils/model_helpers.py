@@ -263,9 +263,9 @@ def get_batch_conversation_embeddings(
         conversations,
         add_generation_prompt=True,
         tokenize=True,
-        return_dict=True,
-        return_tensors="pt",
         processor_kwargs={
+            "return_dict": True,
+            "return_tensors": "pt",
             "padding": True,
         }
     )
@@ -437,9 +437,7 @@ def get_batch_conversation_embeddings_2(
         tokenize=True,
         return_dict=True,
         return_tensors="pt",
-        processor_kwargs={
-            "padding": True,
-        }
+        padding=True,
     )
 
     batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
@@ -518,12 +516,10 @@ def first_stage_batch(images : list[Image.Image], processor : AutoProcessor, mod
     inputs = processor.apply_chat_template(
         conversations,
         add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
         return_tensors="pt",
-        processor_kwargs={
-            "padding": True,
-        }
+        return_dict=True,
+        tokenize=True,
+        padding=True,
     ).to(model.device)
 
     with torch.no_grad():
