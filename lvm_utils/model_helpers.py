@@ -3,6 +3,7 @@ import torch
 from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 from transformers.image_utils import load_image
 from pathlib import Path
+import random
 from peft import MissConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 import peft
 from typing import Any, Dict, Tuple
@@ -14,13 +15,27 @@ from dataclasses import dataclass
 from lvm_utils.utils import upscale_image
 
 
+target_modules=[
+    # Vision and Language Attention
+    "q_proj", "k_proj", "v_proj", "out_proj",
+    
+    # Vision MLP
+    "fc1", "fc2",
+    
+    # Multimodal Projector (essential for aligning the new vision features to text)
+    "linear_1", "linear_2",
+    
+    # Optional: Language Model Feed Forward / Conv if you still want to train the LM heavily
+    "w1", "w2", "w3", "in_proj" 
+]
+
 default_peft_config = MissConfig(
     task_type=TaskType.CAUSAL_LM,
     r=16,
     mini_r=8,
     miss_dropout=0.05,
     bias="none",
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    target_modules=target_modules
 )
 # default_peft_config = peft.IA3Config(
 #     task_type=TaskType.SEQ_CLS, target_modules=["k_proj", "v_proj", "down_proj", "o_proj"], feedforward_modules=["down_proj"]
@@ -150,6 +165,64 @@ def first_stage(image : Image.Image, processor : AutoProcessor, model : AutoMode
         ]})
     return conversation
 
+
+def drop_intermediate_reasoning_from_conversation(
+    conversation,
+    guess_prompt_substring: str = "You must make a guess",
+):
+    """Drop assistant reasoning turns that occur before the final guess prompt.
+
+    This expects the conversation shape:
+    user(image + prompt) -> assistant(reasoning) -> user(final guess prompt).
+    If the final guess prompt is present, assistant turns before that prompt are removed.
+    """
+    if not isinstance(conversation, list):
+        return conversation
+
+    guess_user_idx = None
+    for i, msg in enumerate(conversation):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", [])
+        text_parts = [part.get("text", "") for part in content if part.get("type") == "text"]
+        combined_text = " ".join(text_parts)
+        if guess_prompt_substring in combined_text:
+            guess_user_idx = i
+            break
+
+    if guess_user_idx is None:
+        return conversation
+
+    return [
+        msg
+        for i, msg in enumerate(conversation)
+        if not (i < guess_user_idx and msg.get("role") == "assistant")
+    ]
+
+
+def stochastic_drop_intermediate_reasoning_batch(
+    conversations,
+    drop_probability: float = 0.0,
+    guess_prompt_substring: str = "You must make a guess",
+    rng=None,
+):
+    """Stochastically remove intermediate reasoning turns per conversation in batch."""
+    if not conversations or drop_probability <= 0.0:
+        return conversations
+    if drop_probability >= 1.0:
+        return [
+            drop_intermediate_reasoning_from_conversation(c, guess_prompt_substring=guess_prompt_substring)
+            for c in conversations
+        ]
+
+    rng = rng if rng is not None else random
+    return [
+        drop_intermediate_reasoning_from_conversation(c, guess_prompt_substring=guess_prompt_substring)
+        if rng.random() < drop_probability
+        else c
+        for c in conversations
+    ]
+
 def get_batch_conversation_embeddings(
     model,
     processor,
@@ -157,6 +230,9 @@ def get_batch_conversation_embeddings(
     normalize=True,
     append_token_id=None,
     pad_token_id=None,
+    intermediate_reasoning_drop_probability=0.0,
+    guess_prompt_substring: str = "You must make a guess",
+    intermediate_reasoning_rng=None,
 ):
     """
     Batched embedding extraction for multimodal conversations.
@@ -173,6 +249,13 @@ def get_batch_conversation_embeddings(
         prompt_lens: [B] (position index where appended token was placed)
     """
     device = next(model.parameters()).device
+
+    conversations = stochastic_drop_intermediate_reasoning_batch(
+        conversations,
+        drop_probability=intermediate_reasoning_drop_probability,
+        guess_prompt_substring=guess_prompt_substring,
+        rng=intermediate_reasoning_rng,
+    )
 
     # 1) Process whole batch of conversations
     # conversations should be a list, each item is one conversation list-of-messages.
@@ -299,6 +382,9 @@ def get_batch_conversation_embeddings_with_config(
     conversations,
     config: ConversationEmbeddingConfig,
     normalize=True,
+    intermediate_reasoning_drop_probability=0.0,
+    guess_prompt_substring: str = "You must make a guess",
+    intermediate_reasoning_rng=None,
 ):
     """Training-loop friendly wrapper using precomputed token ids."""
     return get_batch_conversation_embeddings(
@@ -308,6 +394,9 @@ def get_batch_conversation_embeddings_with_config(
         normalize=normalize,
         append_token_id=config.append_token_id,
         pad_token_id=config.pad_token_id,
+        intermediate_reasoning_drop_probability=intermediate_reasoning_drop_probability,
+        guess_prompt_substring=guess_prompt_substring,
+        intermediate_reasoning_rng=intermediate_reasoning_rng,
     )
 
 def get_batch_conversation_embeddings_with_config_2(
