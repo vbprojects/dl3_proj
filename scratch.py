@@ -272,3 +272,30 @@ save_conversations(conversations, "conversations.zip")
 loaded_conversations = load_conversations("conversations.zip")
 #%%
 loaded_conversations[0][0]["content"][0]["image"]
+#%%
+from lvm_utils.model_helpers import load_model_id
+model, processor = load_model_id(load_peft=True)
+# %%
+trainable_model = sum(p.numel() for p in model.parameters() if p.requires_grad)
+total_model = sum(p.numel() for p in model.parameters())
+# trainable_loss = sum(p.numel() for p in loss_func.parameters())\
+from pytorch_metric_learning import losses
+loss_func = losses.ProxyAnchorLoss(
+    num_classes=10, 
+    embedding_size=1024, 
+    margin=0.1, 
+    alpha=32
+)
+trainable_loss = sum(p.numel() for p in loss_func.parameters())
+print(f"Trainable model params (PEFT only): {trainable_model:,}")
+print(f"Total model params (including frozen base): {total_model:,}")
+print(f"Trainable ProxyAnchor params: {trainable_loss:,}")
+print(f"Total trainable optimized params: {trainable_model + trainable_loss:,}")
+print(f"Trainable ratio (model only): {100 * trainable_model / total_model:.4f}%")
+
+#%%
+
+from lvm_utils.mc_head import MonteCarloDropoutHead
+
+head = MonteCarloDropoutHead(1024, 368, dropout_prob=0.3)
+head.to("cuda")

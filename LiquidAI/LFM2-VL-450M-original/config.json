@@ -4,7 +4,7 @@
   ],
   "do_image_splitting": true,
   "downsample_factor": 2,
-  "dtype": "bfloat16",
+  "dtype": "float32",
   "encoder_patch_size": 16,
   "image_token_id": 396,
   "image_token_index": 396,
@@ -19,6 +19,24 @@
   "projector_hidden_act": "gelu",
   "projector_hidden_size": 2560,
   "projector_use_layernorm": true,
+  "quantization_config": {
+    "_load_in_4bit": true,
+    "_load_in_8bit": false,
+    "bnb_4bit_compute_dtype": "bfloat16",
+    "bnb_4bit_quant_storage": "uint8",
+    "bnb_4bit_quant_type": "nf4",
+    "bnb_4bit_use_double_quant": true,
+    "llm_int8_enable_fp32_cpu_offload": false,
+    "llm_int8_has_fp16_weight": false,
+    "llm_int8_skip_modules": [
+      "patch_embedding",
+      "lm_head"
+    ],
+    "llm_int8_threshold": 6.0,
+    "load_in_4bit": true,
+    "load_in_8bit": false,
+    "quant_method": "bitsandbytes"
+  },
   "text_config": {
     "_name_or_path": "LiquidAI/LFM2-350M",
     "architectures": [

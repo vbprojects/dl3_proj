@@ -1,6 +1,6 @@
 #%%
 from tqdm import tqdm
-from torchvision.datasets import CIFAR10
+from torchvision.datasets import CIFAR10, CIFAR100
 from transformers.image_utils import load_image
 
 from lvm_utils.cache_store import FirstStageCache
@@ -8,8 +8,8 @@ from lvm_utils.model_helpers import first_stage, first_stage_batch, load_model_i
 
 
 def generate_cached_conversations(limit=10, split="train", path = "./cache_data", batch_size=4):
-    dataset = CIFAR10(root="./data", download=True, train=(split == "train"))
-    model, processor = load_model_id(load_peft=False)
+    dataset = CIFAR100(root="./data", download=True, train=(split == "train"))
+    model, processor = load_model_id(load_peft=False, quantize = False)
     cache = FirstStageCache(cache_root=path, webp_quality=80, running_ttl_seconds=1800)
 
     recovered = cache.recover_stale_running()
@@ -62,5 +62,5 @@ def generate_cached_conversations(limit=10, split="train", path = "./cache_data"
 
 #%%
 if __name__ == "__main__":
-    cached_conversations = generate_cached_conversations(limit=1400, split="train")
+    cached_conversations = generate_cached_conversations(limit=1400, split="train", path = "./cached_cifar100", batch_size=10)
     print(f"Collected {len(cached_conversations)} conversations")

@@ -18,6 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 import pandas as pd
 from pytorch_metric_learning import losses
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.model_selection import train_test_split
 import json
 import gc
 
@@ -42,7 +43,13 @@ class VLMDataset(Dataset):
             self.label_mapping = {val: i for i, val in enumerate(self.label_uniques)}
         else:
             self.label_mapping = label_mapping
-            self.labels = self.df['label'].map(self.label_mapping).values
+            mapped_labels = self.df['label'].map(self.label_mapping)
+            unknown_mask = mapped_labels.isna()
+            if unknown_mask.any():
+                # Keep only rows whose labels exist in the training mapping.
+                self.df = self.df.loc[~unknown_mask].reset_index(drop=True)
+                mapped_labels = mapped_labels.loc[~unknown_mask].reset_index(drop=True)
+            self.labels = mapped_labels.astype('int64').to_numpy()
             self.label_uniques = pd.Series(list(self.label_mapping.keys()))
         
     def __len__(self):
@@ -68,9 +75,13 @@ def collate_fn(batch):
 # Load index and initialize Dataset
 index = pd.read_parquet("cache_data/index.parquet")
 
-# Split index into train and validation (90% train, 10% val)
-val_index = index.sample(frac=0.1, random_state=42)
-train_index = index.drop(val_index.index)
+# Split index into train and validation (90% train, 10% val), stratified by label
+train_index, val_index = train_test_split(
+    index,
+    test_size=0.1,
+    random_state=42,
+    stratify=index['label'],
+)
 
 train_dataset = VLMDataset(train_index)
 val_dataset = VLMDataset(val_index, label_mapping=train_dataset.label_mapping)
@@ -78,7 +89,8 @@ val_dataset = VLMDataset(val_index, label_mapping=train_dataset.label_mapping)
 batch_size = 5  # Keep this small to avoid VRAM OOM! (12GB -> ~4-8 depending on token length)
 trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
-
+#%%
+next(iter(trainloader))[0][0]
 # %%
 # Setup ProxyAnchorLoss & Optimizer
 # LFM2-VL-450M text config has hidden_size=1024
@@ -87,29 +99,41 @@ try:
 except AttributeError:
     embedding_size = 1024 # Fallback
 
+output_embedding_size = 368
+
 num_classes = len(train_dataset.label_uniques)
 print(f"Initializing ProxyAnchorLoss: classes={num_classes}, embed_dim={embedding_size}")
+from lvm_utils.mc_head import MonteCarloDropoutHead
+
+head = MonteCarloDropoutHead(embedding_size, output_embedding_size, dropout_prob=0.3)
+head.to(model.device)
+
+from torch import nn
+
 
 loss_func = losses.ProxyAnchorLoss(
     num_classes=num_classes, 
-    embedding_size=embedding_size, 
+    embedding_size=output_embedding_size, 
     margin=0.1, 
     alpha=32
 ).to(model.device)
 # sup_con_loss = losses.SupConLoss(temperature=0.1)
 # loss_func = losses.CrossBatchMemory(loss_func, embedding_size, memory_size=40, miner=None)
 
+
 # Ensure we optimize both model (PEFT params) AND the ProxyAnchor embeddings
 trainable_model_params = filter(lambda p: p.requires_grad, model.parameters())
 optimizer = NAdam([
     {"params": trainable_model_params, "lr": 1e-5}, 
-    {"params": loss_func.parameters(), "lr": 1e-3}
+    {"params": loss_func.parameters(), "lr": 1e-3},
+    {"params" : head.parameters(), "lr" : 1e-3}
 ])
 
 # %%
 # Training Loop
 epochs = 20
 accumulation_steps = 8 # Simulate a larger batch size (e.g. batch_size 4 * acc_steps 4 = effective batch 16)
+intermediate_reasoning_drop_probability = 0.3
 llm_eos_config = build_conversation_embedding_config(processor)
 
 model.train()
@@ -131,14 +155,15 @@ for epoch in range(epochs):
         # Mixed Precision Context for fast 4-bit/bfloat16 evaluation
         with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
             # 1. Extract Contrastive Embeddings
-            vecs, lens = get_batch_conversation_embeddings_with_config(
+            vecs_o, lens = get_batch_conversation_embeddings_with_config(
                 model=model, 
                 processor=processor, 
                 conversations=batch_convs, 
                 config=llm_eos_config,
-                normalize=True # Usually desirable for metric learning
+                normalize=True, # Usually desirable for metric learning
+                intermediate_reasoning_drop_probability=intermediate_reasoning_drop_probability,
             )
-            
+            vecs = head(vecs_o)
             # 2. Compute Loss
             loss = loss_func(vecs, batch_labels)
             
@@ -180,16 +205,17 @@ for epoch in range(epochs):
         train_progress = tqdm(trainloader, desc="Extracting Train Embeddings")
         for batch_convs, batch_labels in train_progress:
             with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
-                vecs, lens = get_batch_conversation_embeddings_with_config(
+                vecs_o, lens = get_batch_conversation_embeddings_with_config(
                     model=model, 
                     processor=processor, 
                     conversations=batch_convs, 
                     config=llm_eos_config,
                     normalize=True
                 )
+                vecs = head(vecs_o)
             train_embeddings.append(vecs.float().cpu())
             train_targets.append(batch_labels.cpu())
-            del vecs, batch_convs, batch_labels
+            del vecs, batch_convs, batch_labels, vecs_o
             
         train_embeddings_tensor = torch.cat(train_embeddings)
         train_targets_tensor = torch.cat(train_targets)
@@ -198,16 +224,17 @@ for epoch in range(epochs):
         val_progress = tqdm(valloader, desc="Extracting Val Embeddings")
         for batch_convs, batch_labels in val_progress:
             with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
-                vecs, lens = get_batch_conversation_embeddings_with_config(
+                vecs_o, lens = get_batch_conversation_embeddings_with_config(
                     model=model, 
                     processor=processor, 
                     conversations=batch_convs, 
                     config=llm_eos_config,
                     normalize=True
                 )
+                vecs = head(vecs_o)
             val_embeddings.append(vecs.float().cpu())
             val_targets.append(batch_labels.cpu())
-            del vecs, batch_convs, batch_labels
+            del vecs, batch_convs, batch_labels, vecs_o
             
         val_embeddings_tensor = torch.cat(val_embeddings)
         val_targets_tensor = torch.cat(val_targets)
@@ -226,4 +253,5 @@ model.save_pretrained("./test20poch")
 writer.close()
 
 print("Training cycle complete!")
-    
+    #%%
+import torch; from lvm_utils.model_helpers import load_model_id; model, _ = load_model_id(load_peft=False, quantize=False); print([n for n, m in model.named_modules() if isinstance(m, torch.nn.Linear)])
