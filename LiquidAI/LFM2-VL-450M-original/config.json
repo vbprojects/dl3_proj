@@ -4,7 +4,7 @@
   ],
   "do_image_splitting": true,
   "downsample_factor": 2,
-  "dtype": "float32",
+  "dtype": "bfloat16",
   "encoder_patch_size": 16,
   "image_token_id": 396,
   "image_token_index": 396,
@@ -19,24 +19,6 @@
   "projector_hidden_act": "gelu",
   "projector_hidden_size": 2560,
   "projector_use_layernorm": true,
-  "quantization_config": {
-    "_load_in_4bit": true,
-    "_load_in_8bit": false,
-    "bnb_4bit_compute_dtype": "bfloat16",
-    "bnb_4bit_quant_storage": "uint8",
-    "bnb_4bit_quant_type": "nf4",
-    "bnb_4bit_use_double_quant": true,
-    "llm_int8_enable_fp32_cpu_offload": false,
-    "llm_int8_has_fp16_weight": false,
-    "llm_int8_skip_modules": [
-      "patch_embedding",
-      "lm_head"
-    ],
-    "llm_int8_threshold": 6.0,
-    "load_in_4bit": true,
-    "load_in_8bit": false,
-    "quant_method": "bitsandbytes"
-  },
   "text_config": {
     "_name_or_path": "LiquidAI/LFM2-350M",
     "architectures": [
@@ -44,7 +26,6 @@
     ],
     "block_auto_adjust_ff_dim": true,
     "block_dim": 1024,
-    "block_ff_dim": 6656,
     "block_ffn_dim_multiplier": 1.0,
     "block_mlp_init_scale": 1.0,
     "block_multiple_of": 256,
@@ -60,6 +41,7 @@
     "conv_use_xavier_init": true,
     "dtype": "bfloat16",
     "eos_token_id": 7,
+    "full_attn_idxs": null,
     "hidden_size": 1024,
     "initializer_range": 0.02,
     "intermediate_size": 6656,
@@ -100,7 +82,7 @@
   },
   "tie_word_embeddings": true,
   "tile_size": 512,
-  "transformers_version": "5.3.0",
+  "transformers_version": "5.7.0",
   "use_image_special_tokens": true,
   "use_thumbnail": false,
   "vision_config": {

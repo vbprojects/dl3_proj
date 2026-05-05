@@ -80,7 +80,7 @@ def main():
     metrics_csv_path = os.path.join(run_dir, "metrics.csv")
     with open(metrics_csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "val_acc"])
+        writer.writerow(["epoch", "train_loss", "val_acc", "head_acc"])
 
     print(f"Starting experiment: {experiment_name}")
 
@@ -117,28 +117,40 @@ def main():
 
     print(f"Initializing ProxyAnchorLoss: classes={num_classes}, embed_dim={embedding_size}")
 
-    head = MonteCarloDropoutHead(embedding_size, output_embedding_size, dropout_prob=0.3)
+    head = MonteCarloDropoutHead(
+        embedding_size, output_embedding_size, num_classes,
+        dropout_prob=config.get("head_dropout_prob", 0.3)
+    )
     head.to(model.device)
 
-    loss_func = losses.ProxyAnchorLoss(
-        num_classes=num_classes, 
-        embedding_size=output_embedding_size, 
-        margin=0.1, 
-        alpha=32
-    ).to(model.device)
+    training_mode = config.get("training_mode", "proxy_anchor").lower()
+
+    loss_func = None
+    if training_mode in ("proxy_anchor", "joint"):
+        loss_func = losses.ProxyAnchorLoss(
+            num_classes=num_classes, 
+            embedding_size=output_embedding_size, 
+            margin=0.1, 
+            alpha=32
+        ).to(model.device)
 
     trainable_model_params = filter(lambda p: p.requires_grad, model.parameters())
-    optimizer = NAdam([
-        {"params": trainable_model_params, "lr": config.get("learning_rate_model", 1e-5)}, 
-        {"params": loss_func.parameters(), "lr": config.get("learning_rate_head", 1e-3)},
-        {"params" : head.parameters(), "lr": config.get("learning_rate_head", 1e-3)}
-    ])
+    optimizer_param_groups = [
+        {"params": trainable_model_params, "lr": config.get("learning_rate_model", 1e-5)},
+        {"params": head.parameters(), "lr": config.get("learning_rate_head", 1e-3)}
+    ]
+    if loss_func is not None:
+        optimizer_param_groups.append(
+            {"params": loss_func.parameters(), "lr": config.get("learning_rate_head", 1e-3)}
+        )
+    optimizer = NAdam(optimizer_param_groups)
 
     epochs = config.get("epochs", 20)
     accumulation_steps = config.get("accumulation_steps", 8)
     intermediate_reasoning_drop_probability = config.get("intermediate_reasoning_drop_probability", 0.3)
     checkpoint_interval = config.get("checkpoint_interval", 5)
     eval_interval = config.get("eval_interval", 1)
+    ce_loss_weight = config.get("ce_loss_weight", 0.3)
 
     llm_eos_config = build_conversation_embedding_config(processor)
 
@@ -169,8 +181,15 @@ def main():
                     normalize=True,
                     intermediate_reasoning_drop_probability=intermediate_reasoning_drop_probability,
                 )
-                vecs = head(vecs_o)
-                loss = loss_func(vecs, batch_labels)
+                preds, vecs = head(vecs_o)
+                
+                if training_mode == "joint":
+                    ce_loss = torch.nn.functional.cross_entropy(preds, batch_labels)
+                    loss = loss_func(vecs, batch_labels) + ce_loss_weight * ce_loss
+                elif training_mode == "classification":
+                    loss = torch.nn.functional.cross_entropy(preds, batch_labels)
+                else:  # proxy_anchor
+                    loss = loss_func(vecs, batch_labels)
                 
             loss = loss / accumulation_steps
             loss.backward()
@@ -193,6 +212,7 @@ def main():
         print(f"Epoch {epoch+1} Complete | Average Train Loss: {avg_train_loss:.4f}")
 
         val_acc = 0.0
+        head_acc = 0.0
         # Evaluation
         if (epoch + 1) % eval_interval == 0:
             model.eval()
@@ -211,7 +231,7 @@ def main():
                             model=model, processor=processor, conversations=batch_convs, 
                             config=llm_eos_config, normalize=True
                         )
-                        vecs = head(vecs_o)
+                        _, vecs = head(vecs_o)
                     train_embeddings.append(vecs.float().cpu())
                     train_targets.append(batch_labels.cpu())
                     del vecs, batch_convs, batch_labels, vecs_o
@@ -219,6 +239,7 @@ def main():
                 train_embeddings_tensor = torch.cat(train_embeddings)
                 train_targets_tensor = torch.cat(train_targets)
                 
+                val_preds_list = []
                 val_progress = tqdm(valloader, desc="Extracting Val Embeddings")
                 for batch_convs, batch_labels in val_progress:
                     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
@@ -226,13 +247,21 @@ def main():
                             model=model, processor=processor, conversations=batch_convs, 
                             config=llm_eos_config, normalize=True
                         )
-                        vecs = head(vecs_o)
+                        preds, vecs = head(vecs_o)
                     val_embeddings.append(vecs.float().cpu())
                     val_targets.append(batch_labels.cpu())
-                    del vecs, batch_convs, batch_labels, vecs_o
+                    val_preds_list.append(preds.float().cpu())
+                    del preds, vecs, batch_convs, batch_labels, vecs_o
                     
                 val_embeddings_tensor = torch.cat(val_embeddings)
                 val_targets_tensor = torch.cat(val_targets)
+                val_preds_tensor = torch.cat(val_preds_list)
+                
+                # Head classification accuracy (always computed)
+                predicted_labels = val_preds_tensor.argmax(dim=1)
+                head_acc = (predicted_labels == val_targets_tensor).float().mean().item()
+                tb_writer.add_scalar('Acc/val_head', head_acc, epoch)
+                print(f"Epoch {epoch+1} Complete | Head Classification Val Accuracy: {head_acc:.4f}")
                 
             evaluation_method = config.get("evaluation_method", "knn").lower()
             
@@ -257,7 +286,7 @@ def main():
 
         # Logging Metrics to CSV
         with open(metrics_csv_path, 'a', newline='') as f:
-            csv.writer(f).writerow([epoch + 1, avg_train_loss, val_acc])
+            csv.writer(f).writerow([epoch + 1, avg_train_loss, val_acc, head_acc])
 
         # Checkpointing
         if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == epochs:
@@ -270,7 +299,8 @@ def main():
             
             # Save MC Head, ProxyAnchorLoss params if needed
             torch.save(head.state_dict(), os.path.join(ckpt_dir, "mc_head.pth"))
-            torch.save(loss_func.state_dict(), os.path.join(ckpt_dir, "proxy_anchor_loss.pth"))
+            if loss_func is not None:
+                torch.save(loss_func.state_dict(), os.path.join(ckpt_dir, "proxy_anchor_loss.pth"))
             
             print(f"Checkpoint saved successfully.")
 
