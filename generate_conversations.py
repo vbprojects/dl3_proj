@@ -1,4 +1,5 @@
 #%%
+import torch
 from tqdm import tqdm
 from torchvision.datasets import CIFAR10, CIFAR100
 from transformers.image_utils import load_image
@@ -7,9 +8,62 @@ from lvm_utils.cache_store import FirstStageCache
 from lvm_utils.model_helpers import first_stage, first_stage_batch, load_model_id
 
 
-def generate_cached_conversations(limit=10, split="train", path = "./cache_data", batch_size=4):
+def _auto_detect_batch_size(model, processor, max_batch_size=128) -> int:
+    """Auto-detect the largest batch size that fits in available GPU memory.
+
+    Starts from a small batch size and doubles it until OOM, then returns
+    the last successful size. Uses binary search between the last successful
+    and first failing size for fine-grained tuning.
+
+    Args:
+        model: The loaded model (must be on device).
+        processor: The processor for the model.
+        max_batch_size: Upper bound for batch size search.
+
+    Returns:
+        The largest batch size that fits in memory.
+    """
+    if not torch.cuda.is_available():
+        print("No CUDA available; using default batch_size=4")
+        return 4
+
+    # Create a dummy CIFAR-100 image (3x32x32) for probing
+    from PIL import Image
+    dummy_img = Image.new("RGB", (32, 32), color=(128, 128, 128))
+
+    low, high = 1, max_batch_size
+    best = 1
+
+    while low <= high:
+        mid = (low + high) // 2
+        # Dummy batch at size mid
+        test_images = [load_image(dummy_img) for _ in range(mid)]
+
+        try:
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                first_stage_batch(test_images, processor, model)
+            # Success - free memory
+            torch.cuda.empty_cache()
+            best = mid
+            low = mid + 1  # Try larger batch
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                high = mid - 1  # Try smaller batch
+            else:
+                raise
+
+    return best
+
+
+def generate_cached_conversations(limit=10, split="train", path="./cache_data", batch_size=None):
     dataset = CIFAR100(root="./data", download=True, train=(split == "train"))
-    model, processor = load_model_id(load_peft=False, quantize = False)
+    model, processor = load_model_id(load_peft=False, quantize=False)
+
+    # Auto-detect batch size if not provided
+    if batch_size is None:
+        batch_size = _auto_detect_batch_size(model, processor)
+        print(f"Auto-detected batch_size: {batch_size}")
     cache = FirstStageCache(cache_root=path, webp_quality=80, running_ttl_seconds=1800)
 
     recovered = cache.recover_stale_running()
@@ -62,5 +116,5 @@ def generate_cached_conversations(limit=10, split="train", path = "./cache_data"
 
 #%%
 if __name__ == "__main__":
-    cached_conversations = generate_cached_conversations(limit=1400, split="train", path = "./cached_cifar100", batch_size=10)
+    cached_conversations = generate_cached_conversations(limit=20_000, split="train", path="./cached_cifar100")
     print(f"Collected {len(cached_conversations)} conversations")

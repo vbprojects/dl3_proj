@@ -17,8 +17,9 @@ from sklearn.model_selection import train_test_split
 
 # Custom imports
 from lvm_utils.utils import materialize_conversation_images
-from lvm_utils.model_helpers import load_model_id, build_conversation_embedding_config, get_batch_conversation_embeddings_with_config
+from lvm_utils.model_helpers import load_model_id, build_conversation_embedding_config, get_batch_conversation_embeddings_with_config, target_modules
 from lvm_utils.mc_head import MonteCarloDropoutHead
+from peft import MissConfig, TaskType
 
 class VLMDataset(Dataset):
     def __init__(self, index_df, cache_dir='./cache_data', label_mapping=None):
@@ -57,6 +58,148 @@ def collate_fn(batch):
     convs = [item[0] for item in batch]
     labels = torch.tensor([item[1] for item in batch], dtype=torch.long)
     return convs, labels
+
+
+def _determine_max_batch_size(
+    model, processor, dataset, head, loss_func, llm_eos_config,
+    max_bs=32, drop_prob=0.0, training_mode="proxy_anchor", ce_loss_weight=0.3,
+    device=None
+):
+    """Binary-search / step-down for the largest batch size that doesn't OOM."""
+    if device is None:
+        device = next(model.parameters()).device
+
+    # grab a representative sample of `max_bs` items (or fewer)
+    sample_size = min(max_bs, len(dataset))
+    sample_convs = []
+    for i in range(sample_size):
+        conv, _ = dataset[i]
+        sample_convs.append(conv)
+
+    bs = max_bs
+    while bs > 0:
+        try:
+            torch.cuda.empty_cache()
+            test_convs = sample_convs[:bs]
+            test_labels = torch.tensor(
+                [dataset[i][1] for i in range(bs)], dtype=torch.long, device=device
+            )
+
+            model.eval()
+            head.eval()
+            with torch.no_grad():
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    vecs_o, _ = get_batch_conversation_embeddings_with_config(
+                        model=model,
+                        processor=processor,
+                        conversations=test_convs,
+                        config=llm_eos_config,
+                        normalize=True,
+                        intermediate_reasoning_drop_probability=drop_prob,
+                    )
+                    preds, vecs = head(vecs_o)
+                    if training_mode == "joint":
+                        ce_loss = torch.nn.functional.cross_entropy(preds, test_labels)
+                        _ = loss_func(vecs, test_labels) + ce_loss_weight * ce_loss
+                    elif training_mode == "classification":
+                        _ = torch.nn.functional.cross_entropy(preds, test_labels)
+                    else:
+                        _ = loss_func(vecs, test_labels)
+            model.train()
+            head.train()
+            # Success – this batch size works
+            return bs
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            bs = max(1, bs // 2)
+        except Exception:
+            # Non-memory error – re-raise
+            raise
+    return 1
+
+
+def _train_step_with_oom_recovery(
+    model, processor, head, loss_func, batch_convs, batch_labels,
+    llm_eos_config, accumulation_steps, training_mode, ce_loss_weight,
+    drop_prob, device
+):
+    """Process a training batch, recursively splitting on OOM."""
+    try:
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            vecs_o, lens = get_batch_conversation_embeddings_with_config(
+                model=model,
+                processor=processor,
+                conversations=batch_convs,
+                config=llm_eos_config,
+                normalize=True,
+                intermediate_reasoning_drop_probability=drop_prob,
+            )
+            preds, vecs = head(vecs_o)
+
+            if training_mode == "joint":
+                ce_loss = torch.nn.functional.cross_entropy(preds, batch_labels)
+                loss = loss_func(vecs, batch_labels) + ce_loss_weight * ce_loss
+            elif training_mode == "classification":
+                loss = torch.nn.functional.cross_entropy(preds, batch_labels)
+            else:
+                loss = loss_func(vecs, batch_labels)
+
+        loss = loss / accumulation_steps
+        loss.backward()
+        return loss.item() * accumulation_steps
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        mid = len(batch_convs) // 2
+        if mid < 1:
+            # Single sample still OOMs – skip this batch
+            print("  WARNING: Single-sample OOM, skipping batch.")
+            return 0.0
+
+        left_labels = batch_labels[:mid]
+        right_labels = batch_labels[mid:]
+        left_loss = _train_step_with_oom_recovery(
+            model, processor, head, loss_func,
+            batch_convs[:mid], left_labels,
+            llm_eos_config, accumulation_steps, training_mode, ce_loss_weight,
+            drop_prob, device,
+        )
+        right_loss = _train_step_with_oom_recovery(
+            model, processor, head, loss_func,
+            batch_convs[mid:], right_labels,
+            llm_eos_config, accumulation_steps, training_mode, ce_loss_weight,
+            drop_prob, device,
+        )
+        return (left_loss + right_loss) / 2
+
+
+def _extract_batch_embeddings_with_oom_recovery(
+    model, processor, batch_convs, head, llm_eos_config, device
+):
+    """Extract embeddings from a batch, recursively splitting on OOM."""
+    try:
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                vecs_o, _ = get_batch_conversation_embeddings_with_config(
+                    model=model,
+                    processor=processor,
+                    conversations=batch_convs,
+                    config=llm_eos_config,
+                    normalize=True,
+                )
+                return head(vecs_o)[0]  # return (preds, vecs) – caller can pick
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        mid = len(batch_convs) // 2
+        if mid < 1:
+            raise RuntimeError("Single-sample OOM during extraction.")
+        left = _extract_batch_embeddings_with_oom_recovery(
+            model, processor, batch_convs[:mid], head, llm_eos_config, device
+        )
+        right = _extract_batch_embeddings_with_oom_recovery(
+            model, processor, batch_convs[mid:], head, llm_eos_config, device
+        )
+        return (left + right) / 2
+
 
 def _resolve_checkpoint_dir(path: str) -> str:
     """Resolve a path to the actual checkpoint directory containing adapter weights.
@@ -188,8 +331,18 @@ def main():
 
     print(f"Starting experiment: {experiment_name}")
 
+    # Build MiSS adapter config from config file
+    peft_config = MissConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=config.get("miss_r", 16),
+        mini_r=config.get("miss_mini_r", 8),
+        miss_dropout=config.get("miss_dropout", 0.05),
+        bias="none",
+        target_modules=target_modules,
+    )
+
     # Load Model
-    model, processor = load_model_id(load_peft=True)
+    model, processor = load_model_id(peft_config=peft_config, load_peft=True)
     model.gradient_checkpointing_enable()
 
     # Load Data
@@ -207,7 +360,43 @@ def main():
     train_dataset = VLMDataset(train_index, cache_dir=cache_dir)
     val_dataset = VLMDataset(val_index, cache_dir=cache_dir, label_mapping=train_dataset.label_mapping)
 
-    batch_size = config.get("batch_size", 5)
+    # Determine batch size (auto-detect if enabled in config)
+    base_batch_size = config.get("batch_size", 5)
+    auto_batch = config.get("auto_batch_size", False)
+    batch_size = base_batch_size
+
+    if auto_batch:
+        # Temp head/loss for probing (need them on device before auto-batch)
+        print("Auto-batch mode: setting up temporary head and loss for probing...")
+        try:
+            _embed = model.config.text_config.hidden_size
+        except AttributeError:
+            _embed = 1024
+        _num_classes = len(train_dataset.label_uniques)
+        _temp_head = MonteCarloDropoutHead(
+            _embed, config.get("output_embedding_size", 368), _num_classes,
+            dropout_prob=config.get("head_dropout_prob", 0.3)
+        ).to(model.device)
+        _temp_loss = None
+        _mode = config.get("training_mode", "proxy_anchor").lower()
+        if _mode in ("proxy_anchor", "joint"):
+            _temp_loss = losses.ProxyAnchorLoss(
+                num_classes=_num_classes,
+                embedding_size=config.get("output_embedding_size", 368),
+                margin=0.1, alpha=32,
+            ).to(model.device)
+        _llm_cfg = build_conversation_embedding_config(processor)
+        batch_size = _determine_max_batch_size(
+            model, processor, train_dataset, _temp_head, _temp_loss, _llm_cfg,
+            max_bs=config.get("auto_batch_max_start", 32),
+            drop_prob=config.get("intermediate_reasoning_drop_probability", 0.3),
+            training_mode=_mode,
+            ce_loss_weight=config.get("ce_loss_weight", 0.3),
+        )
+        del _temp_head, _temp_loss, _llm_cfg
+        torch.cuda.empty_cache()
+        print(f"Auto-batch mode: determined max_batch_size = {batch_size}")
+
     trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
 
@@ -308,41 +497,31 @@ def main():
         
         for i, (batch_convs, batch_labels) in enumerate(progress):
             batch_labels = batch_labels.to(model.device)
-            
-            with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
-                vecs_o, lens = get_batch_conversation_embeddings_with_config(
-                    model=model, 
-                    processor=processor, 
-                    conversations=batch_convs, 
-                    config=llm_eos_config,
-                    normalize=True,
-                    intermediate_reasoning_drop_probability=intermediate_reasoning_drop_probability,
-                )
-                preds, vecs = head(vecs_o)
-                
-                if training_mode == "joint":
-                    ce_loss = torch.nn.functional.cross_entropy(preds, batch_labels)
-                    loss = loss_func(vecs, batch_labels) + ce_loss_weight * ce_loss
-                elif training_mode == "classification":
-                    loss = torch.nn.functional.cross_entropy(preds, batch_labels)
-                else:  # proxy_anchor
-                    loss = loss_func(vecs, batch_labels)
-                
-            loss = loss / accumulation_steps
-            loss.backward()
-            
+
+            real_loss = _train_step_with_oom_recovery(
+                model, processor, head, loss_func,
+                batch_convs, batch_labels,
+                llm_eos_config, accumulation_steps,
+                training_mode, ce_loss_weight,
+                intermediate_reasoning_drop_probability,
+                model.device,
+            )
+
+            if real_loss == 0.0:
+                # Batch was skipped due to single-sample OOM
+                continue
+
             if ((i + 1) % accumulation_steps == 0) or (i + 1 == len(trainloader)):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            
-            real_loss = loss.item() * accumulation_steps
+
             epoch_loss += real_loss
             progress.set_postfix({"loss": f"{real_loss:.4f}"})
-            
+
             tb_writer.add_scalar('Loss/train_step', real_loss, global_step)
             global_step += 1
-            
-            del vecs, loss, batch_convs, batch_labels
+
+            del batch_convs, batch_labels
         
         avg_train_loss = epoch_loss / len(trainloader)
         tb_writer.add_scalar('Loss/train_epoch', avg_train_loss, epoch)
@@ -360,46 +539,41 @@ def main():
             val_embeddings = []
             val_targets = []
             
-            with torch.no_grad():
-                train_progress = tqdm(trainloader, desc="Extracting Train Embeddings")
-                for batch_convs, batch_labels in train_progress:
-                    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
-                        vecs_o, lens = get_batch_conversation_embeddings_with_config(
-                            model=model, processor=processor, conversations=batch_convs, 
-                            config=llm_eos_config, normalize=True
-                        )
-                        _, vecs = head(vecs_o)
-                    train_embeddings.append(vecs.float().cpu())
-                    train_targets.append(batch_labels.cpu())
-                    del vecs, batch_convs, batch_labels, vecs_o
-                    
-                train_embeddings_tensor = torch.cat(train_embeddings)
-                train_targets_tensor = torch.cat(train_targets)
-                
-                val_preds_list = []
-                val_progress = tqdm(valloader, desc="Extracting Val Embeddings")
-                for batch_convs, batch_labels in val_progress:
-                    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
-                        vecs_o, lens = get_batch_conversation_embeddings_with_config(
-                            model=model, processor=processor, conversations=batch_convs, 
-                            config=llm_eos_config, normalize=True
-                        )
-                        preds, vecs = head(vecs_o)
-                    val_embeddings.append(vecs.float().cpu())
-                    val_targets.append(batch_labels.cpu())
-                    val_preds_list.append(preds.float().cpu())
-                    del preds, vecs, batch_convs, batch_labels, vecs_o
-                    
-                val_embeddings_tensor = torch.cat(val_embeddings)
-                val_targets_tensor = torch.cat(val_targets)
-                val_preds_tensor = torch.cat(val_preds_list)
-                
-                # Head classification accuracy (always computed)
-                predicted_labels = val_preds_tensor.argmax(dim=1)
-                head_acc = (predicted_labels == val_targets_tensor).float().mean().item()
-                tb_writer.add_scalar('Acc/val_head', head_acc, epoch)
-                print(f"Epoch {epoch+1} Complete | Head Classification Val Accuracy: {head_acc:.4f}")
-                
+            train_progress = tqdm(trainloader, desc="Extracting Train Embeddings")
+            for batch_convs, batch_labels in train_progress:
+                preds_all = _extract_batch_embeddings_with_oom_recovery(
+                    model, processor, batch_convs, head, llm_eos_config, model.device
+                )
+                train_embeddings.append(preds_all[1].float().cpu())
+                train_targets.append(batch_labels.cpu())
+                del preds_all, batch_convs, batch_labels
+
+            train_embeddings_tensor = torch.cat(train_embeddings)
+            train_targets_tensor = torch.cat(train_targets)
+
+            val_preds_list = []
+            val_embeddings = []
+            val_targets = []
+            val_progress = tqdm(valloader, desc="Extracting Val Embeddings")
+            for batch_convs, batch_labels in val_progress:
+                preds_all = _extract_batch_embeddings_with_oom_recovery(
+                    model, processor, batch_convs, head, llm_eos_config, model.device
+                )
+                val_embeddings.append(preds_all[1].float().cpu())
+                val_targets.append(batch_labels.cpu())
+                val_preds_list.append(preds_all[0].float().cpu())
+                del preds_all, batch_convs, batch_labels
+
+            val_embeddings_tensor = torch.cat(val_embeddings)
+            val_targets_tensor = torch.cat(val_targets)
+            val_preds_tensor = torch.cat(val_preds_list)
+
+            # Head classification accuracy (always computed)
+            predicted_labels = val_preds_tensor.argmax(dim=1)
+            head_acc = (predicted_labels == val_targets_tensor).float().mean().item()
+            tb_writer.add_scalar('Acc/val_head', head_acc, epoch)
+            print(f"Epoch {epoch+1} Complete | Head Classification Val Accuracy: {head_acc:.4f}")
+
             evaluation_method = config.get("evaluation_method", "knn").lower()
             
             if evaluation_method == "linear_probe":

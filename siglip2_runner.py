@@ -26,9 +26,11 @@ from sklearn.model_selection import train_test_split
 
 from lvm_utils.mc_head import MonteCarloDropoutHead
 from lvm_utils.model_helpers import (
+    SIGLIP2_TARGET_MODULES,
     get_siglip2_image_embeddings,
     load_siglip2_model,
 )
+from peft import MissConfig, TaskType
 from lvm_utils.utils import materialize_conversation_images
 from lvm_utils.classification_heads import ClassificationHeadEvaluator
 
@@ -97,6 +99,133 @@ def collate_fn(batch):
     images = [item[0] for item in batch]
     labels = torch.tensor([item[1] for item in batch], dtype=torch.long)
     return images, labels
+
+
+# ---------------------------------------------------------------------------
+# OOM recovery helpers
+# ---------------------------------------------------------------------------
+
+def _determine_max_batch_size_siglip(
+    model, processor, dataset, head, loss_func,
+    max_bs=32, training_mode="proxy_anchor", ce_loss_weight=0.3,
+    device=None
+):
+    """Step-down search for the largest batch size that doesn't OOM."""
+    if device is None:
+        device = next(model.parameters()).device
+
+    sample_size = min(max_bs, len(dataset))
+    sample_images = []
+    for i in range(sample_size):
+        img, _ = dataset[i]
+        sample_images.append(img)
+
+    bs = max_bs
+    while bs > 0:
+        try:
+            torch.cuda.empty_cache()
+            test_images = sample_images[:bs]
+            test_labels = torch.tensor(
+                [dataset[i][1] for i in range(bs)], dtype=torch.long, device=device
+            )
+
+            model.eval()
+            head.eval()
+            with torch.no_grad():
+                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                    vecs_o = get_siglip2_image_embeddings(
+                        model=model, processor=processor,
+                        images=test_images, normalize=True,
+                    )
+                    preds, vecs = head(vecs_o)
+                    if training_mode == "joint":
+                        ce_loss = torch.nn.functional.cross_entropy(preds, test_labels)
+                        _ = loss_func(vecs, test_labels) + ce_loss_weight * ce_loss
+                    elif training_mode == "classification":
+                        _ = torch.nn.functional.cross_entropy(preds, test_labels)
+                    else:
+                        _ = loss_func(vecs, test_labels)
+            model.train()
+            head.train()
+            return bs
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            bs = max(1, bs // 2)
+        except Exception:
+            raise
+    return 1
+
+
+def _siglip_train_step_with_oom_recovery(
+    model, processor, head, loss_func, batch_images, batch_labels,
+    accumulation_steps, training_mode, ce_loss_weight, device
+):
+    """Process a SigLIP training batch, recursively splitting on OOM."""
+    try:
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            vecs_o = get_siglip2_image_embeddings(
+                model=model, processor=processor,
+                images=batch_images, normalize=True,
+            )
+            preds, vecs = head(vecs_o)
+
+            if training_mode == "joint":
+                ce_loss = torch.nn.functional.cross_entropy(preds, batch_labels)
+                loss = loss_func(vecs, batch_labels) + ce_loss_weight * ce_loss
+            elif training_mode == "classification":
+                loss = torch.nn.functional.cross_entropy(preds, batch_labels)
+            else:
+                loss = loss_func(vecs, batch_labels)
+
+        loss = loss / accumulation_steps
+        loss.backward()
+        return loss.item() * accumulation_steps
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        mid = len(batch_images) // 2
+        if mid < 1:
+            print("  WARNING: Single-sample OOM, skipping batch.")
+            return 0.0
+
+        left_labels = batch_labels[:mid]
+        right_labels = batch_labels[mid:]
+        left_loss = _siglip_train_step_with_oom_recovery(
+            model, processor, head, loss_func,
+            batch_images[:mid], left_labels,
+            accumulation_steps, training_mode, ce_loss_weight, device,
+        )
+        right_loss = _siglip_train_step_with_oom_recovery(
+            model, processor, head, loss_func,
+            batch_images[mid:], right_labels,
+            accumulation_steps, training_mode, ce_loss_weight, device,
+        )
+        return (left_loss + right_loss) / 2
+
+
+def _siglip_extract_batch_with_oom_recovery(
+    model, processor, batch_images, head, device
+):
+    """Extract SigLIP embeddings from a batch, recursively splitting on OOM."""
+    try:
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                vecs_o = get_siglip2_image_embeddings(
+                    model=model, processor=processor,
+                    images=batch_images, normalize=True,
+                )
+                return head(vecs_o)  # (preds, vecs)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        mid = len(batch_images) // 2
+        if mid < 1:
+            raise RuntimeError("Single-sample OOM during SigLIP extraction.")
+        left = _siglip_extract_batch_with_oom_recovery(
+            model, processor, batch_images[:mid], head, device
+        )
+        right = _siglip_extract_batch_with_oom_recovery(
+            model, processor, batch_images[mid:], head, device
+        )
+        return (left[0] + right[0]) / 2, (left[1] + right[1]) / 2
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +337,18 @@ def main():
 
     print(f"Starting SigLIP 2 experiment: {experiment_name}")
 
+    # Build MiSS adapter config from config file
+    peft_config = MissConfig(
+        task_type=TaskType.FEATURE_EXTRACTION,
+        r=config.get("miss_r", 16),
+        mini_r=config.get("miss_mini_r", 8),
+        miss_dropout=config.get("miss_dropout", 0.05),
+        bias="none",
+        target_modules=SIGLIP2_TARGET_MODULES,
+    )
+
     # --- Load SigLIP 2 model ---
-    model, processor = load_siglip2_model(load_peft=True)
+    model, processor = load_siglip2_model(peft_config=peft_config, load_peft=True)
     model.gradient_checkpointing_enable()
 
     # --- Load Data ---
@@ -229,7 +368,16 @@ def main():
         val_index, cache_dir=cache_dir, label_mapping=train_dataset.label_mapping
     )
 
-    batch_size = config.get("batch_size", 8)
+    base_batch_size = config.get("batch_size", 8)
+    auto_batch = config.get("auto_batch_size", False)
+    batch_size = base_batch_size
+
+    # Auto-batch requires head + loss to exist first, so we create them
+    # temporarily (same pattern as train_runner.py).
+    # We will defer auto-batch logic to after head/loss setup.
+    if auto_batch:
+        batch_size = 1  # placeholder, will be replaced after head/loss setup
+
     trainloader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
     )
@@ -271,6 +419,24 @@ def main():
             margin=0.1,
             alpha=32,
         ).to(model.device)
+
+    # Run auto-batch detection now that head + loss exist
+    if auto_batch:
+        batch_size = _determine_max_batch_size_siglip(
+            model, processor, train_dataset, head, loss_func,
+            max_bs=config.get("auto_batch_max_start", 32),
+            training_mode=training_mode,
+            ce_loss_weight=config.get("ce_loss_weight", 0.3),
+        )
+        torch.cuda.empty_cache()
+        print(f"Auto-batch mode: determined max_batch_size = {batch_size}")
+        # Rebuild DataLoaders with the detected batch size
+        trainloader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
+        )
+        valloader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+        )
 
     # --- Optimizer ---
     trainable_model_params = filter(lambda p: p.requires_grad, model.parameters())
@@ -369,39 +535,27 @@ def main():
         for i, (batch_images, batch_labels) in enumerate(progress):
             batch_labels = batch_labels.to(model.device)
 
-            with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
-                # Extract image embeddings from SigLIP 2
-                vecs_o = get_siglip2_image_embeddings(
-                    model=model,
-                    processor=processor,
-                    images=batch_images,
-                    normalize=True,
-                )
-                preds, vecs = head(vecs_o)
+            real_loss = _siglip_train_step_with_oom_recovery(
+                model, processor, head, loss_func,
+                batch_images, batch_labels,
+                accumulation_steps, training_mode, ce_loss_weight,
+                model.device,
+            )
 
-                if training_mode == "joint":
-                    ce_loss = torch.nn.functional.cross_entropy(preds, batch_labels)
-                    loss = loss_func(vecs, batch_labels) + ce_loss_weight * ce_loss
-                elif training_mode == "classification":
-                    loss = torch.nn.functional.cross_entropy(preds, batch_labels)
-                else:  # proxy_anchor
-                    loss = loss_func(vecs, batch_labels)
-
-            loss = loss / accumulation_steps
-            loss.backward()
+            if real_loss == 0.0:
+                continue
 
             if ((i + 1) % accumulation_steps == 0) or (i + 1 == len(trainloader)):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
 
-            real_loss = loss.item() * accumulation_steps
             epoch_loss += real_loss
             progress.set_postfix({"loss": f"{real_loss:.4f}"})
 
             tb_writer.add_scalar("Loss/train_step", real_loss, global_step)
             global_step += 1
 
-            del vecs_o, preds, vecs, loss, batch_images, batch_labels
+            del batch_images, batch_labels
 
         avg_train_loss = epoch_loss / len(trainloader)
         tb_writer.add_scalar("Loss/train_epoch", avg_train_loss, epoch)
@@ -422,77 +576,62 @@ def main():
             val_targets = []
             val_preds_list = []
 
-            with torch.no_grad():
-                # Extract train embeddings
-                train_progress = tqdm(trainloader, desc="Extracting Train Embeddings")
-                for batch_images, batch_labels in train_progress:
-                    with torch.autocast(
-                        device_type=model.device.type, dtype=torch.bfloat16
-                    ):
-                        vecs_o = get_siglip2_image_embeddings(
-                            model=model,
-                            processor=processor,
-                            images=batch_images,
-                            normalize=True,
-                        )
-                        _, vecs = head(vecs_o)
-                    train_embeddings.append(vecs.float().cpu())
-                    train_targets.append(batch_labels.cpu())
-                    del vecs_o, vecs, batch_images, batch_labels
-
-                train_embeddings_tensor = torch.cat(train_embeddings)
-                train_targets_tensor = torch.cat(train_targets)
-
-                # Fit evaluator on train embeddings (once per eval)
-                head_evaluator.fit_train(train_embeddings_tensor, train_targets_tensor)
-
-                # Extract val embeddings
-                val_progress = tqdm(valloader, desc="Extracting Val Embeddings")
-                for batch_images, batch_labels in val_progress:
-                    with torch.autocast(
-                        device_type=model.device.type, dtype=torch.bfloat16
-                    ):
-                        vecs_o = get_siglip2_image_embeddings(
-                            model=model,
-                            processor=processor,
-                            images=batch_images,
-                            normalize=True,
-                        )
-                        preds, vecs = head(vecs_o)
-                    val_embeddings.append(vecs.float().cpu())
-                    val_targets.append(batch_labels.cpu())
-                    val_preds_list.append(preds.float().cpu())
-                    del vecs_o, preds, vecs, batch_images, batch_labels
-
-                val_embeddings_tensor = torch.cat(val_embeddings)
-                val_targets_tensor = torch.cat(val_targets)
-                val_preds_tensor = torch.cat(val_preds_list)
-
-                # Head classification accuracy
-                predicted_labels = val_preds_tensor.argmax(dim=1)
-                head_acc = (
-                    (predicted_labels == val_targets_tensor).float().mean().item()
+            # Extract train embeddings
+            train_progress = tqdm(trainloader, desc="Extracting Train Embeddings")
+            for batch_images, batch_labels in train_progress:
+                preds_out, vecs_out = _siglip_extract_batch_with_oom_recovery(
+                    model, processor, batch_images, head, model.device
                 )
-                tb_writer.add_scalar("Acc/val_head", head_acc, epoch)
-                print(
-                    f"Epoch {epoch + 1} | Head Classification Val Accuracy: {head_acc:.4f}"
-                )
+                train_embeddings.append(vecs_out.float().cpu())
+                train_targets.append(batch_labels.cpu())
+                del preds_out, vecs_out, batch_images, batch_labels
 
-                # KNN evaluation
-                val_knn_acc = head_evaluator.knn_accuracy(
-                    val_embeddings_tensor, val_targets_tensor
-                )
-                tb_writer.add_scalar("Acc/val_knn", val_knn_acc, epoch)
-                print(f"Epoch {epoch + 1} | k-NN Val Accuracy: {val_knn_acc:.4f}")
+            train_embeddings_tensor = torch.cat(train_embeddings)
+            train_targets_tensor = torch.cat(train_targets)
 
-                # Linear probe evaluation
-                val_linear_acc = head_evaluator.linear_probe_accuracy(
-                    val_embeddings_tensor, val_targets_tensor
+            # Fit evaluator on train embeddings (once per eval)
+            head_evaluator.fit_train(train_embeddings_tensor, train_targets_tensor)
+
+            # Extract val embeddings
+            val_progress = tqdm(valloader, desc="Extracting Val Embeddings")
+            for batch_images, batch_labels in val_progress:
+                preds_out, vecs_out = _siglip_extract_batch_with_oom_recovery(
+                    model, processor, batch_images, head, model.device
                 )
-                tb_writer.add_scalar("Acc/val_linear_probe", val_linear_acc, epoch)
-                print(
-                    f"Epoch {epoch + 1} | Linear Probe Val Accuracy: {val_linear_acc:.4f}"
-                )
+                val_embeddings.append(vecs_out.float().cpu())
+                val_targets.append(batch_labels.cpu())
+                val_preds_list.append(preds_out.float().cpu())
+                del preds_out, vecs_out, batch_images, batch_labels
+
+            val_embeddings_tensor = torch.cat(val_embeddings)
+            val_targets_tensor = torch.cat(val_targets)
+            val_preds_tensor = torch.cat(val_preds_list)
+
+            # Head classification accuracy
+            predicted_labels = val_preds_tensor.argmax(dim=1)
+            head_acc = (
+                (predicted_labels == val_targets_tensor).float().mean().item()
+            )
+            tb_writer.add_scalar("Acc/val_head", head_acc, epoch)
+            print(
+                f"Epoch {epoch + 1} | Head Classification Val Accuracy: {head_acc:.4f}"
+            )
+
+            # KNN evaluation
+            val_knn_acc = head_evaluator.knn_accuracy(
+                val_embeddings_tensor, val_targets_tensor
+            )
+            tb_writer.add_scalar("Acc/val_knn", val_knn_acc, epoch)
+            print(f"Epoch {epoch + 1} | k-NN Val Accuracy: {val_knn_acc:.4f}")
+
+            # Linear probe evaluation
+            val_linear_acc = head_evaluator.linear_probe_accuracy(
+                val_embeddings_tensor, val_targets_tensor
+            )
+            tb_writer.add_scalar("Acc/val_linear_probe", val_linear_acc, epoch)
+            print(
+                f"Epoch {epoch + 1} | Linear Probe Val Accuracy: {val_linear_acc:.4f}"
+            )
 
         # --- Logging ---
         with open(metrics_csv_path, "a", newline="") as f:
