@@ -1,10 +1,8 @@
 #%%
-# Setup argparse, have it grab epoch
-# import argparse
-# parser = argparse.ArgumentParser(description="Train a model with PEFT.")
-# parser.add_argument("--epoch", type=int, default=3, help="The number of epochs to train for.")
-# args = parser.parse_args()
-#%%
+import argparse
+import json
+import os
+
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW, NAdam
@@ -18,8 +16,20 @@ from torch.utils.tensorboard import SummaryWriter
 import pandas as pd
 from pytorch_metric_learning import losses
 from sklearn.neighbors import KNeighborsClassifier
-import json
 import gc
+
+#%%
+# Parse arguments (use parse_known_args so the file can still be run from
+# Jupyter / interactive environments where extra args may be injected)
+parser = argparse.ArgumentParser(description="Train LVM with PEFT.")
+parser.add_argument("--resume_from", type=str, default=None,
+                    help="Path to a checkpoint directory to resume training from.")
+parser.add_argument("--checkpoint_interval", type=int, default=5,
+                    help="Save a checkpoint every N epochs.")
+args, _ = parser.parse_known_args()
+
+resume_from = args.resume_from
+checkpoint_interval = args.checkpoint_interval
 
 #%%
 model, processor = load_model_id(load_peft=True)
@@ -118,6 +128,119 @@ optimizer = NAdam([
     weight_decay = 5e-4)
 llm_eos_config = build_conversation_embedding_config(processor)
 
+def _resolve_checkpoint_dir(path: str) -> str:
+    """Resolve a path to the actual checkpoint directory containing adapter weights.
+
+    Accepts either:
+    - A direct checkpoint directory (``checkpoint-N/``) containing adapter weights.
+    - A run directory whose subdirectories contain ``checkpoint-N/`` folders;
+      in this case the subdirectory with the highest N is selected automatically.
+
+    Raises FileNotFoundError if no valid checkpoint can be found.
+    """
+    if (os.path.isfile(os.path.join(path, "adapter_model.safetensors")) or
+            os.path.isfile(os.path.join(path, "adapter_model.bin"))):
+        return path
+
+    candidates = []
+    for entry in os.scandir(path):
+        if entry.is_dir() and entry.name.startswith("checkpoint-"):
+            try:
+                epoch_num = int(entry.name.split("-")[-1])
+                candidates.append((epoch_num, entry.path))
+            except ValueError:
+                pass
+
+    if not candidates:
+        raise FileNotFoundError(
+            f"No adapter weights or checkpoint subdirectories found in '{path}'. "
+            "Provide a path to a specific 'checkpoint-N' directory or a run directory "
+            "that contains such subdirectories."
+        )
+
+    candidates.sort(key=lambda x: x[0])
+    latest_epoch, latest_path = candidates[-1]
+    print(f"  Auto-selected latest checkpoint: {latest_path} (epoch {latest_epoch})")
+    return latest_path
+
+
+def _load_peft_adapter(model, ckpt_dir: str):
+    """Load saved PEFT adapter weights into an already-initialised PeftModel.
+
+    Tries ``adapter_model.safetensors`` first, then ``adapter_model.bin``.
+    Uses ``peft.set_peft_model_state_dict`` so the adapter name does not need
+    to be known by the caller.
+    """
+    from peft import set_peft_model_state_dict
+
+    safetensors_path = os.path.join(ckpt_dir, "adapter_model.safetensors")
+    bin_path = os.path.join(ckpt_dir, "adapter_model.bin")
+
+    if os.path.isfile(safetensors_path):
+        from safetensors.torch import load_file
+        state_dict = load_file(safetensors_path)
+    elif os.path.isfile(bin_path):
+        state_dict = torch.load(bin_path, map_location="cpu")
+    else:
+        raise FileNotFoundError(
+            f"No adapter weights found in '{ckpt_dir}'. "
+            "Expected 'adapter_model.safetensors' or 'adapter_model.bin'."
+        )
+
+    set_peft_model_state_dict(model, state_dict)
+
+
+#%%
+# Resume from checkpoint (if requested)
+run_dir = "./runs/lvm_training"
+os.makedirs(run_dir, exist_ok=True)
+
+start_epoch = 0
+global_step = 0
+
+if resume_from:
+    resume_from = _resolve_checkpoint_dir(resume_from)
+    print(f"Resuming training from checkpoint: {resume_from}")
+
+    # Restore PEFT adapter weights
+    _load_peft_adapter(model, resume_from)
+    print("  Loaded PEFT adapter weights.")
+
+    # Restore MC head
+    head_ckpt = os.path.join(resume_from, "mc_head.pth")
+    if os.path.isfile(head_ckpt):
+        head.load_state_dict(torch.load(head_ckpt, map_location=model.device))
+        print("  Loaded MC head weights.")
+
+    # Restore ProxyAnchor loss proxies
+    loss_ckpt = os.path.join(resume_from, "proxy_anchor_loss.pth")
+    if os.path.isfile(loss_ckpt):
+        loss_func.load_state_dict(torch.load(loss_ckpt, map_location=model.device))
+        print("  Loaded ProxyAnchorLoss weights.")
+
+    # Restore optimizer
+    opt_ckpt = os.path.join(resume_from, "optimizer.pth")
+    if os.path.isfile(opt_ckpt):
+        optimizer.load_state_dict(torch.load(opt_ckpt, map_location="cpu"))
+        print("  Loaded optimizer state.")
+
+    # Restore training progress
+    state_path = os.path.join(resume_from, "training_state.json")
+    if os.path.isfile(state_path):
+        with open(state_path, "r") as f:
+            training_state = json.load(f)
+        start_epoch = training_state.get("epoch", 0)
+        global_step = training_state.get("global_step", 0)
+        print(f"  Resuming from epoch {start_epoch}, global step {global_step}.")
+    else:
+        # Infer epoch from directory name (e.g. "checkpoint-10" -> start at epoch 10)
+        dir_name = os.path.basename(resume_from.rstrip("/"))
+        if dir_name.startswith("checkpoint-"):
+            try:
+                start_epoch = int(dir_name.split("-")[-1])
+                print(f"  Inferred start epoch {start_epoch} from directory name (no training_state.json found).")
+            except ValueError:
+                pass
 
 #%%
 # Training Loop
@@ -128,10 +251,9 @@ llm_eos_config = build_conversation_embedding_config(processor)
 model.train()
 torch.cuda.empty_cache()
 
-writer = SummaryWriter(log_dir="./runs/lvm_training")
-global_step = 0
+writer = SummaryWriter(log_dir=run_dir)
 
-for epoch in range(epochs):
+for epoch in range(start_epoch, epochs):
     print(f"\n--- Epoch {epoch+1}/{epochs} ---")
     epoch_loss = 0.0
 
@@ -254,8 +376,21 @@ for epoch in range(epochs):
 
     model.train()
 
+    # --- Checkpointing ---
+    if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == epochs:
+        ckpt_dir = os.path.join(run_dir, f"checkpoint-{epoch + 1}")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        print(f"Saving checkpoint to {ckpt_dir}...")
+
+        model.save_pretrained(ckpt_dir)
+        torch.save(head.state_dict(), os.path.join(ckpt_dir, "mc_head.pth"))
+        torch.save(loss_func.state_dict(), os.path.join(ckpt_dir, "proxy_anchor_loss.pth"))
+        torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pth"))
+        with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
+            json.dump({"epoch": epoch + 1, "global_step": global_step}, f)
+        print("Checkpoint saved successfully.")
+
 model.save_pretrained("./test20poch")
 writer.close()
 
 print("Training cycle complete!")
-

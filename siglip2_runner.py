@@ -1,62 +1,107 @@
+"""Training loop for SigLIP 2 fine-tuning with MissConfig PEFT.
+
+Supports three training modes:
+  - proxy_anchor: ProxyAnchorLoss on projected embeddings
+  - joint: ProxyAnchorLoss + cross-entropy classification head
+  - classification: Cross-entropy only
+
+Evaluates with KNN and linear probe heads.
+"""
+
 import argparse
+import csv
 import json
 import os
-import csv
-import torch
-import pandas as pd
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import NAdam
-from tqdm import tqdm
-from dotenv import load_dotenv
 
+import pandas as pd
+import torch
+from dotenv import load_dotenv
+from torch.optim import NAdam
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
 from pytorch_metric_learning import losses
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 
-# Custom imports
-from lvm_utils.utils import materialize_conversation_images
-from lvm_utils.model_helpers import load_model_id, build_conversation_embedding_config, get_batch_conversation_embeddings_with_config
 from lvm_utils.mc_head import MonteCarloDropoutHead
+from lvm_utils.model_helpers import (
+    get_siglip2_image_embeddings,
+    load_siglip2_model,
+)
+from lvm_utils.utils import materialize_conversation_images
+from lvm_utils.classification_heads import ClassificationHeadEvaluator
+
+
+# ---------------------------------------------------------------------------
+# Dataset (reuses existing cached conversation format, extracts images only)
+# ---------------------------------------------------------------------------
 
 class VLMDataset(Dataset):
-    def __init__(self, index_df, cache_dir='./cache_data', label_mapping=None):
-        self.df = index_df[index_df['status'].isin(['done', 'STATUS_DONE'])].reset_index(drop=True)
+    """Loads cached conversations and yields (image, label) pairs.
+
+    Reuses the existing conversation cache format but only extracts the
+    first image from each conversation for SigLIP 2 embedding extraction.
+    """
+
+    def __init__(self, index_df, cache_dir="./cache_data", label_mapping=None):
+        self.df = index_df[index_df["status"].isin(["done", "STATUS_DONE"])].reset_index(
+            drop=True
+        )
         self.cache_dir = cache_dir
-        
-        if 'label' not in self.df.columns:
+
+        if "label" not in self.df.columns:
             raise KeyError("The index dataframe must contain a 'label' column.")
-            
+
         if label_mapping is None:
-            self.labels, self.label_uniques = pd.factorize(self.df['label'])
+            self.labels, self.label_uniques = pd.factorize(self.df["label"])
             self.label_mapping = {val: i for i, val in enumerate(self.label_uniques)}
         else:
             self.label_mapping = label_mapping
-            mapped_labels = self.df['label'].map(self.label_mapping)
+            mapped_labels = self.df["label"].map(self.label_mapping)
             unknown_mask = mapped_labels.isna()
             if unknown_mask.any():
                 self.df = self.df.loc[~unknown_mask].reset_index(drop=True)
                 mapped_labels = mapped_labels.loc[~unknown_mask].reset_index(drop=True)
-            self.labels = mapped_labels.astype('int64').to_numpy()
+            self.labels = mapped_labels.astype("int64").to_numpy()
             self.label_uniques = pd.Series(list(self.label_mapping.keys()))
-        
+
     def __len__(self):
         return len(self.df)
-        
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        conv_path = os.path.join(self.cache_dir, row['conversation_json_path'])
+        conv_path = os.path.join(self.cache_dir, row["conversation_json_path"])
         with open(conv_path, "r") as f:
             raw_conv = json.load(f)
-        
+
         conv = materialize_conversation_images(raw_conv, self.cache_dir)
-        return conv, self.labels[idx]
+
+        # Extract the first image from the conversation
+        image = None
+        for msg in conv:
+            for item in msg.get("content", []):
+                if item.get("type") == "image":
+                    image = item["image"]
+                    break
+            if image is not None:
+                break
+
+        if image is None:
+            raise ValueError(f"No image found in conversation at index {idx}")
+
+        return image, self.labels[idx]
+
 
 def collate_fn(batch):
-    convs = [item[0] for item in batch]
+    images = [item[0] for item in batch]
     labels = torch.tensor([item[1] for item in batch], dtype=torch.long)
-    return convs, labels
+    return images, labels
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
 
 def _resolve_checkpoint_dir(path: str) -> str:
     """Resolve a path to the actual checkpoint directory containing adapter weights.
@@ -68,12 +113,10 @@ def _resolve_checkpoint_dir(path: str) -> str:
 
     Raises FileNotFoundError if no valid checkpoint can be found.
     """
-    # Direct checkpoint directory: already contains adapter weights
     if (os.path.isfile(os.path.join(path, "adapter_model.safetensors")) or
             os.path.isfile(os.path.join(path, "adapter_model.bin"))):
         return path
 
-    # Run directory: look for checkpoint-N subdirectories
     candidates = []
     for entry in os.scandir(path):
         if entry.is_dir() and entry.name.startswith("checkpoint-"):
@@ -90,40 +133,10 @@ def _resolve_checkpoint_dir(path: str) -> str:
             "that contains such subdirectories."
         )
 
-    # Pick the checkpoint with the highest epoch number
     candidates.sort(key=lambda x: x[0])
     latest_epoch, latest_path = candidates[-1]
     print(f"  Auto-selected latest checkpoint: {latest_path} (epoch {latest_epoch})")
     return latest_path
-
-
-def _infer_start_epoch(resume_dir: str):
-    """Infer the start epoch and global step from a checkpoint directory.
-
-    Resolution order:
-    1. ``training_state.json`` written by the runner at save time.
-    2. Parse the epoch number from a directory name matching ``checkpoint-{N}``.
-    3. Return (0, 0) if neither source is available.
-
-    Returns:
-        (start_epoch, global_step)
-    """
-    state_path = os.path.join(resume_dir, "training_state.json")
-    if os.path.isfile(state_path):
-        with open(state_path, "r") as f:
-            state = json.load(f)
-        return state.get("epoch", 0), state.get("global_step", 0)
-
-    # Fall back to parsing the directory name (e.g. "checkpoint-10")
-    dir_name = os.path.basename(resume_dir.rstrip("/"))
-    if dir_name.startswith("checkpoint-"):
-        try:
-            epoch = int(dir_name.split("-")[-1])
-            print(f"  Inferred start epoch {epoch} from directory name (no training_state.json found).")
-            return epoch, 0
-        except ValueError:
-            pass
-    return 0, 0
 
 
 def _load_peft_adapter(model, ckpt_dir: str):
@@ -152,9 +165,17 @@ def _load_peft_adapter(model, ckpt_dir: str):
     set_peft_model_state_dict(model, state_dict)
 
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Run LVM Training with PEFT using a config file.")
-    parser.add_argument("--config", type=str, required=True, help="Path to the JSON configuration file.")
+    parser = argparse.ArgumentParser(
+        description="Run SigLIP 2 Training with MissConfig PEFT using a config file."
+    )
+    parser.add_argument(
+        "--config", type=str, required=True, help="Path to the JSON configuration file."
+    )
     parser.add_argument(
         "--resume_from",
         type=str,
@@ -163,8 +184,7 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load Config
-    with open(args.config, 'r') as f:
+    with open(args.config, "r") as f:
         config = json.load(f)
 
     load_dotenv()
@@ -172,27 +192,27 @@ def main():
     # --resume_from flag takes precedence over config value
     resume_from = args.resume_from or config.get("resume_from_checkpoint", None)
 
-    experiment_name = config.get("experiment_name", "experiment")
+    experiment_name = config.get("experiment_name", "siglip2_experiment")
     run_dir = os.path.join("runs", experiment_name)
     os.makedirs(run_dir, exist_ok=True)
-    
-    # Save a copy of the config in the run directory for reproducibility
-    with open(os.path.join(run_dir, "config.json"), 'w') as f:
+
+    # Save config for reproducibility
+    with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(config, f, indent=4)
-        
+
     metrics_csv_path = os.path.join(run_dir, "metrics.csv")
     if not resume_from:
-        with open(metrics_csv_path, 'w', newline='') as f:
+        with open(metrics_csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "train_loss", "val_acc", "head_acc"])
+            writer.writerow(["epoch", "train_loss", "val_knn_acc", "val_linear_acc", "head_acc"])
 
-    print(f"Starting experiment: {experiment_name}")
+    print(f"Starting SigLIP 2 experiment: {experiment_name}")
 
-    # Load Model
-    model, processor = load_model_id(load_peft=True)
+    # --- Load SigLIP 2 model ---
+    model, processor = load_siglip2_model(load_peft=True)
     model.gradient_checkpointing_enable()
 
-    # Load Data
+    # --- Load Data ---
     index_path = config.get("index_path", "cache_data/index.parquet")
     index = pd.read_parquet(index_path)
 
@@ -200,63 +220,82 @@ def main():
         index,
         test_size=config.get("test_size", 0.1),
         random_state=42,
-        stratify=index['label'],
+        stratify=index["label"],
     )
 
     cache_dir = config.get("cache_dir", "./cache_data")
     train_dataset = VLMDataset(train_index, cache_dir=cache_dir)
-    val_dataset = VLMDataset(val_index, cache_dir=cache_dir, label_mapping=train_dataset.label_mapping)
+    val_dataset = VLMDataset(
+        val_index, cache_dir=cache_dir, label_mapping=train_dataset.label_mapping
+    )
 
-    batch_size = config.get("batch_size", 5)
-    trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
-    valloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn)
+    batch_size = config.get("batch_size", 8)
+    trainloader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn
+    )
+    valloader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+    )
 
+    # --- Setup head ---
     try:
-        embedding_size = model.config.text_config.hidden_size
+        embedding_size = model.config.vision_config.hidden_size
     except AttributeError:
-        embedding_size = 1024
+        embedding_size = 768  # SigLIP base fallback
 
     output_embedding_size = config.get("output_embedding_size", 368)
     num_classes = len(train_dataset.label_uniques)
 
-    print(f"Initializing ProxyAnchorLoss: classes={num_classes}, embed_dim={embedding_size}")
+    print(
+        f"Embedding dim: {embedding_size}, "
+        f"Output dim: {output_embedding_size}, "
+        f"Classes: {num_classes}"
+    )
 
     head = MonteCarloDropoutHead(
-        embedding_size, output_embedding_size, num_classes,
-        dropout_prob=config.get("head_dropout_prob", 0.3)
+        embedding_size,
+        output_embedding_size,
+        num_classes,
+        dropout_prob=config.get("head_dropout_prob", 0.3),
     )
     head.to(model.device)
 
+    # --- Loss function ---
     training_mode = config.get("training_mode", "proxy_anchor").lower()
 
     loss_func = None
     if training_mode in ("proxy_anchor", "joint"):
         loss_func = losses.ProxyAnchorLoss(
-            num_classes=num_classes, 
-            embedding_size=output_embedding_size, 
-            margin=0.1, 
-            alpha=32
+            num_classes=num_classes,
+            embedding_size=output_embedding_size,
+            margin=0.1,
+            alpha=32,
         ).to(model.device)
 
+    # --- Optimizer ---
     trainable_model_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer_param_groups = [
-        {"params": trainable_model_params, "lr": config.get("learning_rate_model", 1e-5)},
-        {"params": head.parameters(), "lr": config.get("learning_rate_head", 1e-3)}
+        {
+            "params": trainable_model_params,
+            "lr": config.get("learning_rate_model", 5e-4),
+        },
+        {"params": head.parameters(), "lr": config.get("learning_rate_head", 5e-3)},
     ]
     if loss_func is not None:
         optimizer_param_groups.append(
-            {"params": loss_func.parameters(), "lr": config.get("learning_rate_head", 1e-3)}
+            {
+                "params": loss_func.parameters(),
+                "lr": config.get("learning_rate_head", 5e-3),
+            }
         )
     optimizer = NAdam(optimizer_param_groups)
 
+    # --- Hyperparameters ---
     epochs = config.get("epochs", 20)
-    accumulation_steps = config.get("accumulation_steps", 8)
-    intermediate_reasoning_drop_probability = config.get("intermediate_reasoning_drop_probability", 0.3)
+    accumulation_steps = config.get("accumulation_steps", 4)
+    ce_loss_weight = config.get("ce_loss_weight", 0.3)
     checkpoint_interval = config.get("checkpoint_interval", 5)
     eval_interval = config.get("eval_interval", 1)
-    ce_loss_weight = config.get("ce_loss_weight", 0.3)
-
-    llm_eos_config = build_conversation_embedding_config(processor)
 
     # --- Resume from checkpoint ---
     start_epoch = 0
@@ -288,38 +327,58 @@ def main():
             optimizer.load_state_dict(torch.load(opt_ckpt, map_location="cpu"))
             print("  Loaded optimizer state.")
 
-        # Restore training progress (with automatic inference from dir name as fallback)
-        start_epoch, global_step = _infer_start_epoch(resume_from)
-        print(f"  Resuming from epoch {start_epoch}, global step {global_step}.")
+        # Restore training progress
+        state_path = os.path.join(resume_from, "training_state.json")
+        if os.path.isfile(state_path):
+            with open(state_path, "r") as f:
+                training_state = json.load(f)
+            start_epoch = training_state.get("epoch", 0)
+            global_step = training_state.get("global_step", 0)
+            print(f"  Resuming from epoch {start_epoch}, global step {global_step}.")
+        else:
+            # Infer epoch from directory name (e.g. "checkpoint-10" → start at epoch 10)
+            dir_name = os.path.basename(resume_from.rstrip("/"))
+            if dir_name.startswith("checkpoint-"):
+                try:
+                    start_epoch = int(dir_name.split("-")[-1])
+                    print(f"  Inferred start epoch {start_epoch} from directory name (no training_state.json found).")
+                except ValueError:
+                    pass
 
+    # --- Evaluation ---
+    head_evaluator = ClassificationHeadEvaluator(
+        n_neighbors=config.get("k_neighbors", 5),
+        linear_probe_max_iter=config.get("linear_probe_max_iter", 1000),
+    )
+
+    # --- TensorBoard ---
     tb_writer = SummaryWriter(log_dir=run_dir)
 
-    print("Beginning Training Loop...")
+    print("Beginning SigLIP 2 Training Loop...")
     for epoch in range(start_epoch, epochs):
         model.train()
         head.train()
         torch.cuda.empty_cache()
 
-        print(f"\n--- Epoch {epoch+1}/{epochs} ---")
+        print(f"\n--- Epoch {epoch + 1}/{epochs} ---")
         epoch_loss = 0.0
-        
+
         progress = tqdm(trainloader, desc="Training")
         optimizer.zero_grad(set_to_none=True)
-        
-        for i, (batch_convs, batch_labels) in enumerate(progress):
+
+        for i, (batch_images, batch_labels) in enumerate(progress):
             batch_labels = batch_labels.to(model.device)
-            
+
             with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
-                vecs_o, lens = get_batch_conversation_embeddings_with_config(
-                    model=model, 
-                    processor=processor, 
-                    conversations=batch_convs, 
-                    config=llm_eos_config,
+                # Extract image embeddings from SigLIP 2
+                vecs_o = get_siglip2_image_embeddings(
+                    model=model,
+                    processor=processor,
+                    images=batch_images,
                     normalize=True,
-                    intermediate_reasoning_drop_probability=intermediate_reasoning_drop_probability,
                 )
                 preds, vecs = head(vecs_o)
-                
+
                 if training_mode == "joint":
                     ce_loss = torch.nn.functional.cross_entropy(preds, batch_labels)
                     loss = loss_func(vecs, batch_labels) + ce_loss_weight * ce_loss
@@ -327,125 +386,141 @@ def main():
                     loss = torch.nn.functional.cross_entropy(preds, batch_labels)
                 else:  # proxy_anchor
                     loss = loss_func(vecs, batch_labels)
-                
+
             loss = loss / accumulation_steps
             loss.backward()
-            
+
             if ((i + 1) % accumulation_steps == 0) or (i + 1 == len(trainloader)):
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            
+
             real_loss = loss.item() * accumulation_steps
             epoch_loss += real_loss
             progress.set_postfix({"loss": f"{real_loss:.4f}"})
-            
-            tb_writer.add_scalar('Loss/train_step', real_loss, global_step)
-            global_step += 1
-            
-            del vecs, loss, batch_convs, batch_labels
-        
-        avg_train_loss = epoch_loss / len(trainloader)
-        tb_writer.add_scalar('Loss/train_epoch', avg_train_loss, epoch)
-        print(f"Epoch {epoch+1} Complete | Average Train Loss: {avg_train_loss:.4f}")
 
-        val_acc = 0.0
+            tb_writer.add_scalar("Loss/train_step", real_loss, global_step)
+            global_step += 1
+
+            del vecs_o, preds, vecs, loss, batch_images, batch_labels
+
+        avg_train_loss = epoch_loss / len(trainloader)
+        tb_writer.add_scalar("Loss/train_epoch", avg_train_loss, epoch)
+        print(f"Epoch {epoch + 1} Complete | Average Train Loss: {avg_train_loss:.4f}")
+
+        # --- Evaluation ---
+        val_knn_acc = 0.0
+        val_linear_acc = 0.0
         head_acc = 0.0
-        # Evaluation
+
         if (epoch + 1) % eval_interval == 0:
             model.eval()
             head.eval()
-            
+
             train_embeddings = []
             train_targets = []
             val_embeddings = []
             val_targets = []
-            
+            val_preds_list = []
+
             with torch.no_grad():
+                # Extract train embeddings
                 train_progress = tqdm(trainloader, desc="Extracting Train Embeddings")
-                for batch_convs, batch_labels in train_progress:
-                    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
-                        vecs_o, lens = get_batch_conversation_embeddings_with_config(
-                            model=model, processor=processor, conversations=batch_convs, 
-                            config=llm_eos_config, normalize=True
+                for batch_images, batch_labels in train_progress:
+                    with torch.autocast(
+                        device_type=model.device.type, dtype=torch.bfloat16
+                    ):
+                        vecs_o = get_siglip2_image_embeddings(
+                            model=model,
+                            processor=processor,
+                            images=batch_images,
+                            normalize=True,
                         )
                         _, vecs = head(vecs_o)
                     train_embeddings.append(vecs.float().cpu())
                     train_targets.append(batch_labels.cpu())
-                    del vecs, batch_convs, batch_labels, vecs_o
-                    
+                    del vecs_o, vecs, batch_images, batch_labels
+
                 train_embeddings_tensor = torch.cat(train_embeddings)
                 train_targets_tensor = torch.cat(train_targets)
-                
-                val_preds_list = []
+
+                # Fit evaluator on train embeddings (once per eval)
+                head_evaluator.fit_train(train_embeddings_tensor, train_targets_tensor)
+
+                # Extract val embeddings
                 val_progress = tqdm(valloader, desc="Extracting Val Embeddings")
-                for batch_convs, batch_labels in val_progress:
-                    with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16):
-                        vecs_o, lens = get_batch_conversation_embeddings_with_config(
-                            model=model, processor=processor, conversations=batch_convs, 
-                            config=llm_eos_config, normalize=True
+                for batch_images, batch_labels in val_progress:
+                    with torch.autocast(
+                        device_type=model.device.type, dtype=torch.bfloat16
+                    ):
+                        vecs_o = get_siglip2_image_embeddings(
+                            model=model,
+                            processor=processor,
+                            images=batch_images,
+                            normalize=True,
                         )
                         preds, vecs = head(vecs_o)
                     val_embeddings.append(vecs.float().cpu())
                     val_targets.append(batch_labels.cpu())
                     val_preds_list.append(preds.float().cpu())
-                    del preds, vecs, batch_convs, batch_labels, vecs_o
-                    
+                    del vecs_o, preds, vecs, batch_images, batch_labels
+
                 val_embeddings_tensor = torch.cat(val_embeddings)
                 val_targets_tensor = torch.cat(val_targets)
                 val_preds_tensor = torch.cat(val_preds_list)
-                
-                # Head classification accuracy (always computed)
+
+                # Head classification accuracy
                 predicted_labels = val_preds_tensor.argmax(dim=1)
-                head_acc = (predicted_labels == val_targets_tensor).float().mean().item()
-                tb_writer.add_scalar('Acc/val_head', head_acc, epoch)
-                print(f"Epoch {epoch+1} Complete | Head Classification Val Accuracy: {head_acc:.4f}")
-                
-            evaluation_method = config.get("evaluation_method", "knn").lower()
-            
-            if evaluation_method == "linear_probe":
-                clf = LogisticRegression(
-                    max_iter=config.get("linear_probe_max_iter", 1000), 
-                    n_jobs=-1
+                head_acc = (
+                    (predicted_labels == val_targets_tensor).float().mean().item()
                 )
-                clf.fit(train_embeddings_tensor.numpy(), train_targets_tensor.numpy())
-                val_acc = clf.score(val_embeddings_tensor.numpy(), val_targets_tensor.numpy())
-                
-                tb_writer.add_scalar('Acc/val_linear_probe', val_acc, epoch)
-                print(f"Epoch {epoch+1} Complete | Linear Probe Val Accuracy: {val_acc:.4f}")
-                
-            else: # Fallback to k-NN
-                knn = KNeighborsClassifier(n_neighbors=config.get("k_neighbors", 5))
-                knn.fit(train_embeddings_tensor.numpy(), train_targets_tensor.numpy())
-                val_acc = knn.score(val_embeddings_tensor.numpy(), val_targets_tensor.numpy())
-                
-                tb_writer.add_scalar('Acc/val_knn', val_acc, epoch)
-                print(f"Epoch {epoch+1} Complete | k-NN Val Accuracy: {val_acc:.4f}")
+                tb_writer.add_scalar("Acc/val_head", head_acc, epoch)
+                print(
+                    f"Epoch {epoch + 1} | Head Classification Val Accuracy: {head_acc:.4f}"
+                )
 
-        # Logging Metrics to CSV
-        with open(metrics_csv_path, 'a', newline='') as f:
-            csv.writer(f).writerow([epoch + 1, avg_train_loss, val_acc, head_acc])
+                # KNN evaluation
+                val_knn_acc = head_evaluator.knn_accuracy(
+                    val_embeddings_tensor, val_targets_tensor
+                )
+                tb_writer.add_scalar("Acc/val_knn", val_knn_acc, epoch)
+                print(f"Epoch {epoch + 1} | k-NN Val Accuracy: {val_knn_acc:.4f}")
 
-        # Checkpointing
+                # Linear probe evaluation
+                val_linear_acc = head_evaluator.linear_probe_accuracy(
+                    val_embeddings_tensor, val_targets_tensor
+                )
+                tb_writer.add_scalar("Acc/val_linear_probe", val_linear_acc, epoch)
+                print(
+                    f"Epoch {epoch + 1} | Linear Probe Val Accuracy: {val_linear_acc:.4f}"
+                )
+
+        # --- Logging ---
+        with open(metrics_csv_path, "a", newline="") as f:
+            csv.writer(f).writerow(
+                [epoch + 1, avg_train_loss, val_knn_acc, val_linear_acc, head_acc]
+            )
+
+        # --- Checkpointing ---
         if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == epochs:
-            ckpt_dir = os.path.join(run_dir, f"checkpoint-{epoch+1}")
+            ckpt_dir = os.path.join(run_dir, f"checkpoint-{epoch + 1}")
             os.makedirs(ckpt_dir, exist_ok=True)
             print(f"Saving checkpoint to {ckpt_dir}...")
-            
-            # Save LoRA adapter
+
             model.save_pretrained(ckpt_dir)
-            
-            # Save MC Head, ProxyAnchorLoss params if needed
             torch.save(head.state_dict(), os.path.join(ckpt_dir, "mc_head.pth"))
             if loss_func is not None:
-                torch.save(loss_func.state_dict(), os.path.join(ckpt_dir, "proxy_anchor_loss.pth"))
+                torch.save(
+                    loss_func.state_dict(),
+                    os.path.join(ckpt_dir, "proxy_anchor_loss.pth"),
+                )
             torch.save(optimizer.state_dict(), os.path.join(ckpt_dir, "optimizer.pth"))
             with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
                 json.dump({"epoch": epoch + 1, "global_step": global_step}, f)
-
-            print(f"Checkpoint saved successfully.")
+            print("Checkpoint saved successfully.")
 
     tb_writer.close()
-    print("Training completely finished!")
+    print("SigLIP 2 training completely finished!")
+
 
 if __name__ == "__main__":
     main()

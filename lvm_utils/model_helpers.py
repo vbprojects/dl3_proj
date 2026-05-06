@@ -1,12 +1,12 @@
 import torch
 import torch
-from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
+from transformers import AutoProcessor, AutoModelForImageTextToText, AutoModel, BitsAndBytesConfig
 from transformers.image_utils import load_image
 from pathlib import Path
 import random
 from peft import MissConfig, TaskType, get_peft_model, prepare_model_for_kbit_training
 import peft
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 from PIL import Image
 import torch
 import torch.nn.functional as F
@@ -493,6 +493,7 @@ def get_batch_conversation_embeddings_2(
         emb = F.normalize(emb, p=2, dim=-1)
 
     return emb, prompt_lens
+
 def first_stage_batch(images : list[Image.Image], processor : AutoProcessor, model : AutoModelForImageTextToText, max_tokens = 300) -> list[Dict[str, Any]]:
     conversations = []
     for image in images:
@@ -536,3 +537,111 @@ def first_stage_batch(images : list[Image.Image], processor : AutoProcessor, mod
     
     return conversations
 
+
+# ---------------------------------------------------------------------------
+# SigLIP 2 helpers
+# ---------------------------------------------------------------------------
+
+SIGLIP2_TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "out_proj",
+    "fc1", "fc2",
+]
+
+_siglip2_default_peft_config = MissConfig(
+    task_type=TaskType.FEATURE_EXTRACTION,
+    r=16,
+    mini_r=8,
+    miss_dropout=0.05,
+    bias="none",
+    target_modules=SIGLIP2_TARGET_MODULES,
+)
+
+SIGLIP2_MODEL_ID = "google/siglip2-base-patch16-224"
+
+
+def load_siglip2_model(
+    model_id: str = SIGLIP2_MODEL_ID,
+    peft_config: Any = _siglip2_default_peft_config,
+    cache: bool = True,
+    load_peft: bool = True,
+    torch_dtype: torch.dtype = torch.bfloat16,
+    **kwargs,
+) -> Tuple[AutoModel, AutoProcessor]:
+    """Load a SigLIP 2 dual-encoder model with MissConfig PEFT applied.
+
+    SigLIP 2 is a ViT + text encoder model (not an autoregressive LM).
+    We wrap it with MissConfig for fine-tuning and return the model + processor.
+
+    Args:
+        model_id: HuggingFace model id (default google/siglip2-base-patch16-224).
+        peft_config: MissConfig instance.
+        cache: Cache original weights locally for faster reloads.
+        load_peft: Apply PEFT to the model.
+        torch_dtype: Model compute dtype.
+
+    Returns:
+        (model, processor)
+    """
+    cached_dir = Path("./" + model_id.replace("/", "_") + "-original")
+
+    if cached_dir.exists() and cache:
+        model = AutoModel.from_pretrained(
+            str(cached_dir),
+            device_map="auto",
+            torch_dtype=torch_dtype,
+            **kwargs,
+        )
+        processor = AutoProcessor.from_pretrained(str(cached_dir))
+    else:
+        model = AutoModel.from_pretrained(
+            model_id,
+            device_map="auto",
+            torch_dtype=torch_dtype,
+            **kwargs,
+        )
+        processor = AutoProcessor.from_pretrained(model_id)
+        if cache:
+            model.save_pretrained(str(cached_dir))
+            processor.save_pretrained(str(cached_dir))
+
+    if load_peft:
+        model = get_peft_model(model, peft_config)
+
+    return model, processor
+
+
+def get_siglip2_image_embeddings(
+    model: AutoModel,
+    processor: AutoProcessor,
+    images: list[Image.Image],
+    normalize: bool = True,
+) -> torch.Tensor:
+    """Extract L2-normalised image embeddings from a SigLIP 2 model.
+
+    Uses the model's built-in ``get_image_features`` which handles the
+    vision encoder, pooling, and optional projection head.
+
+    Args:
+        model: SigLIP 2 model (possibly PEFT-wrapped).
+        processor: Corresponding HuggingFace processor.
+        images: List of PIL images.
+        normalize: L2-normalise output embeddings.
+
+    Returns:
+        [B, D] float tensor on the model's device.
+    """
+    device = next(model.parameters()).device
+
+    # The SigLIP processor expects images as-is (no chat template)
+    inputs = processor(images=images, return_tensors="pt", padding=True)
+    inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
+
+    # get_image_features returns BaseModelOutputWithPooling;
+    # extract the pooled embeddings tensor [B, embed_dim]
+    outputs = model.get_image_features(**inputs)
+    emb = outputs.pooler_output
+
+    if normalize:
+        emb = F.normalize(emb, p=2, dim=-1)
+
+    return emb
