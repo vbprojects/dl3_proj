@@ -7,16 +7,16 @@ evaluates on a separate test set using Monte-Carlo dropout sampling.
 Usage examples:
     # Evaluate a SigLIP 2 run
     python evaluate_mc_dropout.py \
-        --run_dir runs/siglip2_proxy_anchor_low_data \
+        --run_dir runs/cifar100_ntxent_cbm \
         --model_type siglip \
         --train_cache_dir cached_cifar100 \
         --test_cache_dir cached_cifar100_test \
-        --mc_samples 10 \
+        --mc_samples 20 \
         --batch_size 512 
 
     # Evaluate an LVM run
     python evaluate_mc_dropout.py \
-        --run_dir runs/cifar100_miss_small \
+        --run_dir runs/cifar100_miss_medium \
         --model_type lvm \
         --train_cache_dir cached_cifar100 \
         --test_cache_dir cached_cifar100_test \
@@ -336,7 +336,7 @@ def main():
              "(e.g., cached_cifar100_test).",
     )
     parser.add_argument(
-        "--mc_samples", type=int, default=10,
+        "--mc_samples", type=int, default=20,
         help="Number of Monte-Carlo dropout samples (default: 10).",
     )
     parser.add_argument(
@@ -372,6 +372,7 @@ def main():
     miss_r = config.get("miss_r", 16)
     miss_mini_r = config.get("miss_mini_r", 8)
     miss_dropout = config.get("miss_dropout", 0.05)
+    train_fraction = config.get("train_fraction", 0.3)
 
     print(f"\n{'='*60}")
     print(f"Monte-Carlo Dropout Evaluation")
@@ -383,6 +384,8 @@ def main():
     print(f"  MC samples       : {args.mc_samples}")
     print(f"  Batch size       : {args.batch_size}")
     print(f"  KNN neighbors    : {k_neighbors}")
+    if train_fraction < 1.0:
+        print(f"  Train fraction   : {train_fraction}")
     print(f"{'='*60}\n")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -461,6 +464,19 @@ def main():
     if not os.path.isfile(train_index_path):
         raise FileNotFoundError(f"Train index not found at {train_index_path}")
     train_index_full = pd.read_parquet(train_index_path)
+
+    # Optional: sample a fraction of the training data (e.g., 0.3 = 30%)
+    # to match the training configuration used during model training
+    if train_fraction < 1.0:
+        original_train_size = len(train_index_full)
+        train_index_full = train_index_full.sample(
+            frac=train_fraction,
+            random_state=42,
+            replace=False,
+        )
+        print(f"  Sampled {train_fraction*100:.1f}% of training data: "
+              f"{len(train_index_full)} samples (from {original_train_size} total)")
+
     _, train_label_uniques = pd.factorize(train_index_full["label"])
     num_classes = len(train_label_uniques)
     train_label_mapping = {val: i for i, val in enumerate(train_label_uniques)}

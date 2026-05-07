@@ -62,5 +62,5 @@ def generate_cached_conversations(limit=10, split="train", size="full", path="./
 
 #%%
 if __name__ == "__main__":
-    cached_conversations = generate_cached_conversations(limit=10_000, split="train", size="full", path="./cached_imagenette", batch_size=10)
+    cached_conversations = generate_cached_conversations(limit=10_000, split="val", size="full", path="./cached_imagenette_test", batch_size=64)
     print(f"Collected {len(cached_conversations)} conversations")
