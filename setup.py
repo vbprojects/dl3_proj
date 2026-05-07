@@ -5,14 +5,22 @@ setup(
     version="0.1.0",
     packages=find_packages(),
     install_requires=[
+        "accelerate",
         "torch",
+        "torchvision",
         "transformers",
         "peft",
         "bitsandbytes",
         "Pillow",
         "numpy",
+        "pandas",
+        "scikit-learn",
+        "tqdm",
+        "python-dotenv",
+        "tensorboard",
+        "safetensors",
         "pyarrow",
-        "pandas"
+        "datasets"
     ],
     description="LVM utility functions and caching",
 )
