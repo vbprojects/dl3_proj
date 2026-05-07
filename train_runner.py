@@ -186,7 +186,7 @@ def _extract_batch_embeddings_with_oom_recovery(
                     config=llm_eos_config,
                     normalize=True,
                 )
-                return head(vecs_o)[0]  # return (preds, vecs) – caller can pick
+                return head(vecs_o)  # return (preds, vecs)
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         mid = len(batch_convs) // 2
@@ -198,7 +198,7 @@ def _extract_batch_embeddings_with_oom_recovery(
         right = _extract_batch_embeddings_with_oom_recovery(
             model, processor, batch_convs[mid:], head, llm_eos_config, device
         )
-        return (left + right) / 2
+        return torch.cat([left[0], right[0]], dim=0), torch.cat([left[1], right[1]], dim=0)
 
 
 def _resolve_checkpoint_dir(path: str) -> str:
@@ -355,6 +355,16 @@ def main():
         random_state=42,
         stratify=index['label'],
     )
+
+    # Optional: sample a fraction of the training data (e.g., 0.1 = 10%)
+    train_fraction = config.get("train_fraction", 1.0)
+    if train_fraction < 1.0:
+        train_index = train_index.sample(
+            frac=train_fraction,
+            random_state=42,
+            replace=False,
+        )
+        print(f"Sampled {train_fraction*100:.1f}% of training data: {len(train_index)} samples (from {len(index)} total)")
 
     cache_dir = config.get("cache_dir", "./cache_data")
     train_dataset = VLMDataset(train_index, cache_dir=cache_dir)
@@ -538,8 +548,22 @@ def main():
             train_targets = []
             val_embeddings = []
             val_targets = []
-            
-            train_progress = tqdm(trainloader, desc="Extracting Train Embeddings")
+
+            # Optional: sample a subset of training data for evaluation to speed up KNN/linear probe
+            eval_train_fraction = config.get("eval_train_fraction", 1.0)
+            eval_train_dataset = train_dataset
+            if eval_train_fraction < 1.0:
+                num_samples = max(1, int(len(train_dataset) * eval_train_fraction))
+                indices = torch.randperm(len(train_dataset), generator=torch.Generator().manual_seed(42))[:num_samples]
+                from torch.utils.data import Subset
+                eval_train_dataset = Subset(train_dataset, indices.tolist())
+                print(f"  Sampling {num_samples}/{len(train_dataset)} training examples for evaluation ({eval_train_fraction*100:.1f}%)")
+
+            eval_trainloader = DataLoader(
+                eval_train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+            )
+
+            train_progress = tqdm(eval_trainloader, desc="Extracting Train Embeddings")
             for batch_convs, batch_labels in train_progress:
                 preds_all = _extract_batch_embeddings_with_oom_recovery(
                     model, processor, batch_convs, head, llm_eos_config, model.device

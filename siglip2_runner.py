@@ -362,6 +362,16 @@ def main():
         stratify=index["label"],
     )
 
+    # Optional: sample a fraction of the training data (e.g., 0.1 = 10%)
+    train_fraction = config.get("train_fraction", 1.0)
+    if train_fraction < 1.0:
+        train_index = train_index.sample(
+            frac=train_fraction,
+            random_state=42,
+            replace=False,
+        )
+        print(f"Sampled {train_fraction*100:.1f}% of training data: {len(train_index)} samples (from {len(index)} total)")
+
     cache_dir = config.get("cache_dir", "./cache_data")
     train_dataset = VLMDataset(train_index, cache_dir=cache_dir)
     val_dataset = VLMDataset(
@@ -576,8 +586,22 @@ def main():
             val_targets = []
             val_preds_list = []
 
+            # Optional: sample a subset of training data for evaluation to speed up KNN/linear probe
+            eval_train_fraction = config.get("eval_train_fraction", 1.0)
+            eval_train_dataset = train_dataset
+            if eval_train_fraction < 1.0:
+                num_samples = max(1, int(len(train_dataset) * eval_train_fraction))
+                indices = torch.randperm(len(train_dataset), generator=torch.Generator().manual_seed(42))[:num_samples]
+                from torch.utils.data import Subset
+                eval_train_dataset = Subset(train_dataset, indices.tolist())
+                print(f"  Sampling {num_samples}/{len(train_dataset)} training examples for evaluation ({eval_train_fraction*100:.1f}%)")
+
+            eval_trainloader = DataLoader(
+                eval_train_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+            )
+
             # Extract train embeddings
-            train_progress = tqdm(trainloader, desc="Extracting Train Embeddings")
+            train_progress = tqdm(eval_trainloader, desc="Extracting Train Embeddings")
             for batch_images, batch_labels in train_progress:
                 preds_out, vecs_out = _siglip_extract_batch_with_oom_recovery(
                     model, processor, batch_images, head, model.device
