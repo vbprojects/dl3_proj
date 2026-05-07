@@ -7,11 +7,12 @@ evaluates on a separate test set using Monte-Carlo dropout sampling.
 Usage examples:
     # Evaluate a SigLIP 2 run
     python evaluate_mc_dropout.py \
-        --run_dir runs/siglip2_proxy_anchor \
+        --run_dir runs/siglip2_proxy_anchor_low_data \
         --model_type siglip \
         --train_cache_dir cached_cifar100 \
         --test_cache_dir cached_cifar100_test \
-        --mc_samples 10
+        --mc_samples 10 \
+        --batch_size 512 
 
     # Evaluate an LVM run
     python evaluate_mc_dropout.py \
@@ -19,7 +20,7 @@ Usage examples:
         --model_type lvm \
         --train_cache_dir cached_cifar100 \
         --test_cache_dir cached_cifar100_test \
-        --mc_samples 20
+        --mc_samples 20 \
         --batch_size 128
 """
 
